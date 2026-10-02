@@ -279,9 +279,9 @@ class StixRelayTests(unittest.TestCase):
         self.assertEqual([IDENTITY_ID, INDICATOR_ID, MALWARE_ID], [item["id"] for item in first])
 
     def test_unknown_collection_is_not_found(self):
-        with self.assertRaisesRegex(NotFoundError, "was not found"):
+        with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
             self.service.list_objects("missing")
-        with self.assertRaisesRegex(NotFoundError, "was not found"):
+        with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
             self.service.add_object("missing", identity(), "k1")
 
     def test_idempotent_create_returns_the_first_result(self):
