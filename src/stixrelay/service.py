@@ -126,7 +126,7 @@ class StixRelay:
         return document
 
     def _require_references(self, collection_id: str, stix_object: StixObject) -> None:
-        """Every relationship endpoint must already exist in the same collection."""
+        """Every referenced object must already exist in the same collection."""
         for reference in stix_object.references():
             row = self.store.connection.execute(
                 "SELECT version FROM objects WHERE collection_id = ? AND object_id = ?"
@@ -135,8 +135,8 @@ class StixRelay:
             ).fetchone()
             if not row:
                 raise ValidationError(
-                    f"relationship references unknown {identifier_type(reference)} {reference}"
-                    f" in collection {collection_id}"
+                    f"{stix_object.type} references unknown {identifier_type(reference)}"
+                    f" {reference} in collection {collection_id}"
                 )
 
     # ------------------------------------------------------------------- public

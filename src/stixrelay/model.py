@@ -8,13 +8,17 @@ from typing import Any
 from .errors import ValidationError
 
 # Object types this release can store, and the STIX id prefix each one uses.
-OBJECT_TYPES = ("identity", "indicator", "malware", "relationship")
+OBJECT_TYPES = ("identity", "indicator", "malware", "relationship", "report")
 ID_PREFIX = {
     "identity": "identity",
     "indicator": "indicator",
     "malware": "malware",
     "relationship": "relationship",
+    "report": "report",
 }
+
+# A report may only point at these object types through `object_refs`.
+REPORT_REF_TYPES = ("identity", "indicator", "malware", "relationship")
 
 # Character classes are written as explicit alternations: a literal hyphen inside a
 # bracket expression is easy to mis-read (and can leak unexpected characters into
@@ -94,6 +98,13 @@ TYPE_PROPERTIES: dict[str, dict[str, str]] = {
         "start_time": "timestamp",
         "stop_time": "timestamp",
     },
+    "report": {
+        "name": "string",
+        "description": "string",
+        "published": "timestamp",
+        "report_types": "string_array",
+        "object_refs": "report_refs",
+    },
 }
 
 REQUIRED_PROPERTIES: dict[str, tuple[str, ...]] = {
@@ -101,6 +112,7 @@ REQUIRED_PROPERTIES: dict[str, tuple[str, ...]] = {
     "indicator": ("name", "pattern", "valid_from"),
     "malware": ("name", "is_family"),
     "relationship": ("relationship_type", "source_ref", "target_ref"),
+    "report": ("name", "published", "object_refs"),
 }
 
 MEDIA_TYPE = "application/stix+json;version=2.1"
@@ -238,6 +250,25 @@ def _validate_relationship_type(value: Any, field: str) -> str:
     return text
 
 
+def _validate_report_refs(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValidationError(f"{field} must be a non-empty array of STIX identifiers")
+    references: list[str] = []
+    for index, item in enumerate(value):
+        location = f"{field}[{index}]"
+        reference = validate_identifier(item, location)
+        target_type = identifier_type(reference)
+        if target_type not in REPORT_REF_TYPES:
+            raise ValidationError(
+                f"{location} must reference one of {', '.join(REPORT_REF_TYPES)};"
+                f" got {target_type}"
+            )
+        if reference in references:
+            raise ValidationError(f"{field} must not contain the duplicate reference {reference}")
+        references.append(reference)
+    return references
+
+
 def _validate_property(value: Any, kind: str, field: str) -> Any:
     if kind == "string":
         return _validate_string(value, field)
@@ -255,6 +286,8 @@ def _validate_property(value: Any, kind: str, field: str) -> Any:
         return _validate_pattern(value, field)
     if kind == "relationship_type":
         return _validate_relationship_type(value, field)
+    if kind == "report_refs":
+        return _validate_report_refs(value, field)
     if kind == "external_references":
         return _validate_external_references(value, field)
     if kind == "kill_chain_phases":
@@ -360,9 +393,11 @@ class StixObject:
         return document
 
     def references(self) -> tuple[str, ...]:
-        if self.type != "relationship":
-            return ()
-        return (self.properties["source_ref"], self.properties["target_ref"])
+        if self.type == "relationship":
+            return (self.properties["source_ref"], self.properties["target_ref"])
+        if self.type == "report":
+            return tuple(self.properties["object_refs"])
+        return ()
 
     def version_key(self) -> str:
         """The TAXII version identifier of this revision."""

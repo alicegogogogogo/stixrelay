@@ -12,7 +12,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from stixrelay.server import Handler
 from stixrelay.service import StixRelay
-from test_service import IDENTITY_ID, MALWARE_ID, identity, indicator, malware
+from test_service import (
+    IDENTITY_ID,
+    INDICATOR_ID,
+    MALWARE_ID,
+    REPORT_ID,
+    identity,
+    indicator,
+    malware,
+    report,
+)
 
 IDENTITY_ADDED_AT = "2024-01-02T00:00:00Z"
 IDENTITY_VERSION = "2024-01-01T00:00:00.000000Z"
@@ -365,6 +374,178 @@ class HttpTests(unittest.TestCase):
         status, body = self.request("GET", "/taxii2/collections/missing/objects/?limit=1")
         self.assertEqual(404, status)
         self.assertEqual("not_found", body["error"]["code"])
+
+    # ----------------------------------------------------------------- reports
+
+    def test_report_flow_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "r1", "title": "Reports"}, "r0")
+
+        # A report before its references exist is a validation error.
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/r1/objects/",
+            dict(report(), added_at="2024-02-03T00:00:00Z"),
+            "r1-bad",
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+        self.assertIn("references unknown", body["error"]["message"])
+
+        status, _ = self.request(
+            "POST",
+            "/taxii2/collections/r1/objects/",
+            dict(indicator(), added_at="2024-02-01T00:00:00Z"),
+            "r1-ind",
+        )
+        self.assertEqual(201, status)
+        status, _ = self.request(
+            "POST",
+            "/taxii2/collections/r1/objects/",
+            dict(identity(), added_at="2024-02-02T00:00:00Z"),
+            "r1-ide",
+        )
+        self.assertEqual(201, status)
+
+        # Same key, now with both references present, succeeds: the failed write
+        # consumed neither the object nor the idempotency key.
+        status, first = self.request(
+            "POST",
+            "/taxii2/collections/r1/objects/",
+            dict(report(), added_at="2024-02-03T00:00:00Z"),
+            "r1-bad",
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(REPORT_ID, first["object"]["id"])
+        self.assertEqual("2024-03-01T00:00:00.000000Z", first["object"]["published"])
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID], first["object"]["object_refs"])
+
+        status, repeated = self.request(
+            "POST",
+            "/taxii2/collections/r1/objects/",
+            dict(report(), added_at="2024-02-03T00:00:00Z"),
+            "r1-bad",
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(first, repeated)
+
+        status, body = self.request(
+            "GET", "/taxii2/collections/r1/objects/?type=report"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([REPORT_ID], [item["id"] for item in body["objects"]])
+        self.assertEqual(["report"], body["type"])
+
+        status, body = self.request(
+            "GET",
+            f"/taxii2/collections/r1/objects/{REPORT_ID}/versions/",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["2024-01-01T00:00:00.000000Z"], body["versions"])
+
+        # A revision drops one reference and must still validate against current set.
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/r1/objects/",
+            dict(
+                report(
+                    modified="2024-04-01T00:00:00Z", object_refs=[INDICATOR_ID]
+                ),
+                added_at="2024-04-02T00:00:00Z",
+            ),
+            "r1-v2",
+        )
+        self.assertEqual(201, status)
+        self.assertEqual([INDICATOR_ID], body["object"]["object_refs"])
+
+        status, body = self.request(
+            "GET", "/taxii2/collections/r1/objects/?added_after=2024-04-01T00:00:00Z"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([REPORT_ID], [item["id"] for item in body["objects"]])
+
+    def test_report_validation_errors_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "r2", "title": "Reports 2"}, "rr0")
+        self.request(
+            "POST",
+            "/taxii2/collections/r2/objects/",
+            dict(identity(), added_at="2024-02-01T00:00:00Z"),
+            "rr-ide",
+        )
+        cases = (
+            dict(object_refs=[]),
+            dict(object_refs=[IDENTITY_ID, IDENTITY_ID]),
+            dict(object_refs=["report--a1a1a1a1-1a1a-4a1a-8a1a-1a1a1a1a1a1a"]),
+            dict(object_refs=["campaign--a1a1a1a1-1a1a-4a1a-8a1a-1a1a1a1a1a1a"]),
+            dict(object_refs=["identity--nope"]),
+            dict(published="March 1st"),
+            dict(report_types=[]),
+            dict(extra=1),
+        )
+        for index, overrides in enumerate(cases):
+            status, body = self.request(
+                "POST",
+                "/taxii2/collections/r2/objects/",
+                dict(report(report_id="report--d000000%d-0000-4000-8000-00000000000%d" % (index, index)), **overrides),
+                f"rr-bad-{index}",
+            )
+            self.assertEqual(400, status, overrides)
+            self.assertEqual("validation_error", body["error"]["code"], overrides)
+
+    def test_report_pagination_echoes_type_and_freezes_snapshot(self):
+        self.request("POST", "/taxii2/collections", {"id": "r3", "title": "Reports 3"}, "rp0")
+        self.request(
+            "POST",
+            "/taxii2/collections/r3/objects/",
+            dict(identity(), added_at="2024-02-01T00:00:00Z"),
+            "rp-ide",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections/r3/objects/",
+            dict(indicator(), added_at="2024-02-02T00:00:00Z"),
+            "rp-ind",
+        )
+        reports = (
+            ("report--e1000001-0000-4000-8000-000000000001", "2024-03-01T00:00:00Z"),
+            ("report--e1000002-0000-4000-8000-000000000002", "2024-03-02T00:00:00Z"),
+        )
+        for index, (report_id, added) in enumerate(reports, start=1):
+            status, _ = self.request(
+                "POST",
+                "/taxii2/collections/r3/objects/",
+                dict(
+                    report(report_id=report_id, modified=added),
+                    added_at=added,
+                ),
+                f"rp-{index}",
+            )
+            self.assertEqual(201, status)
+
+        status, first = self.request(
+            "GET", "/taxii2/collections/r3/objects/?type=report&limit=1"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["report"], first["type"])
+        self.assertEqual(1, len(first["objects"]))
+        self.assertTrue(first["more"])
+
+        # A late revision stays out of the open snapshot.
+        self.request(
+            "POST",
+            "/taxii2/collections/r3/objects/",
+            dict(
+                report(report_id=reports[0][0], modified="2024-05-01T00:00:00Z"),
+                added_at="2024-05-02T00:00:00Z",
+            ),
+            "rp-late",
+        )
+        status, second = self.request(
+            "GET", f"/taxii2/collections/r3/objects/?next={first['next']}"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["report"], second["type"])
+        self.assertEqual([reports[1][0]], [item["id"] for item in second["objects"]])
+        self.assertFalse(second["more"])
 
 
 if __name__ == "__main__":

@@ -9,8 +9,11 @@ IDENTITY_ID = "identity--f431f809-377b-45e0-aa1c-6a4751cae5ff"
 INDICATOR_ID = "indicator--a2f4b7d8-2c7e-4a4b-9d0e-6f6a1c9d3f21"
 MALWARE_ID = "malware--3c9d1e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
 RELATIONSHIP_ID = "relationship--b6a1e2c3-1f2a-4b3c-8d4e-5f6a7b8c9d0e"
+REPORT_ID = "report--c7d8e9f0-1a2b-4c3d-8e4f-5a6b7c8d9e0f"
+REPORT2_ID = "report--d8e9f012-3b4c-4d5e-9f50-6a7b8c9d0e1f"
 
 CREATED = "2024-01-01T00:00:00Z"
+REPORT_PUBLISHED = "2024-03-01T00:00:00Z"
 
 
 def identity(*, modified: str = CREATED, name: str = "Example Org") -> dict:
@@ -62,6 +65,27 @@ def relationship(*, modified: str = CREATED) -> dict:
         "relationship_type": "indicates",
         "source_ref": INDICATOR_ID,
         "target_ref": IDENTITY_ID,
+    }
+
+
+def report(
+    *,
+    modified: str = CREATED,
+    object_refs: list[str] | None = None,
+    published: str = REPORT_PUBLISHED,
+    report_id: str = REPORT_ID,
+) -> dict:
+    return {
+        "type": "report",
+        "spec_version": "2.1",
+        "id": report_id,
+        "created": CREATED,
+        "modified": modified,
+        "name": "Monthly report",
+        "description": "What happened this month",
+        "published": published,
+        "report_types": ["threat-report"],
+        "object_refs": [INDICATOR_ID, IDENTITY_ID] if object_refs is None else object_refs,
     }
 
 
@@ -283,6 +307,236 @@ class StixRelayTests(unittest.TestCase):
             self.service.list_objects("missing")
         with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
             self.service.add_object("missing", identity(), "k1")
+
+    # ------------------------------------------------------------------ reports
+
+    def _seed_report_targets(self):
+        self.add(indicator(), "rep-ind", added_at="2024-01-02T00:00:00Z")
+        self.add(identity(), "rep-ide", added_at="2024-01-03T00:00:00Z")
+
+    def test_report_references_must_already_exist_in_the_collection(self):
+        with self.assertRaisesRegex(ValidationError, "report references unknown indicator"):
+            self.add(report(), "k1")
+        with self.assertRaises(NotFoundError):
+            self.service.object_versions("feed", REPORT_ID)
+        self.assertEqual([], self.service.list_objects("feed", ["report"]).to_json()["objects"])
+
+    def test_report_is_stored_once_every_reference_exists(self):
+        self._seed_report_targets()
+        self.add(malware(), "rep-mal", added_at="2024-01-04T00:00:00Z")
+        self.add(relationship(), "rep-rel", added_at="2024-01-05T00:00:00Z")
+        stored = self.add(
+            report(object_refs=[RELATIONSHIP_ID, MALWARE_ID, INDICATOR_ID, IDENTITY_ID]),
+            "rep-1",
+            added_at="2024-01-06T00:00:00Z",
+        )
+        document = stored["object"]
+        self.assertEqual("report", document["type"])
+        self.assertEqual(REPORT_ID, document["id"])
+        self.assertEqual("Monthly report", document["name"])
+        self.assertEqual("What happened this month", document["description"])
+        self.assertEqual("2024-03-01T00:00:00.000000Z", document["published"])
+        self.assertEqual(["threat-report"], document["report_types"])
+        self.assertEqual(
+            [RELATIONSHIP_ID, MALWARE_ID, INDICATOR_ID, IDENTITY_ID], document["object_refs"]
+        )
+        self.assertEqual("2024-01-06T00:00:00.000000Z", stored["added_at"])
+        listed = self.service.list_objects("feed", ["report"]).to_json()
+        self.assertEqual([document], listed["objects"])
+        self.assertEqual(["report"], listed["type"])
+
+    def test_report_optional_properties_are_absent_when_omitted(self):
+        self._seed_report_targets()
+        minimal = {
+            key: value
+            for key, value in report().items()
+            if key not in ("description", "report_types")
+        }
+        stored = self.add(minimal, "rep-min")
+        self.assertNotIn("description", stored["object"])
+        self.assertNotIn("report_types", stored["object"])
+
+    def test_report_rejecting_an_unknown_target_persists_nothing(self):
+        self._seed_report_targets()
+        with self.assertRaisesRegex(ValidationError, "report references unknown malware"):
+            self.add(report(object_refs=[IDENTITY_ID, MALWARE_ID]), "rep-bad")
+        self.assertEqual([], self.service.list_objects("feed", ["report"]).to_json()["objects"])
+        with self.assertRaises(NotFoundError):
+            self.service.object_versions("feed", REPORT_ID)
+        # The rolled back write did not consume the idempotency key.
+        self.add(malware(), "rep-mal", added_at="2024-01-04T00:00:00Z")
+        stored = self.service.add_object(
+            "feed",
+            dict(report(object_refs=[IDENTITY_ID, MALWARE_ID]), added_at="2024-01-06T00:00:00Z"),
+            "rep-bad",
+        )
+        self.assertEqual(201, stored.status)
+
+    def test_report_reference_to_another_collection_is_unknown(self):
+        self._seed_report_targets()
+        self.service.create_collection({"id": "other", "title": "Other feed"}, "co")
+        self.service.add_object("other", dict(malware(), added_at="2024-01-04T00:00:00Z"), "ko")
+        with self.assertRaisesRegex(ValidationError, "report references unknown malware"):
+            self.add(report(object_refs=[MALWARE_ID]), "rep-cross")
+
+    def test_report_object_refs_must_be_non_empty_unique_and_supported(self):
+        self._seed_report_targets()
+        cases = (
+            ([], "non-empty array of STIX identifiers"),
+            (IDENTITY_ID, "non-empty array of STIX identifiers"),
+            ([IDENTITY_ID, IDENTITY_ID], "duplicate reference"),
+            ([1], "must be a STIX identifier"),
+            ([""], "must be a STIX identifier"),
+            (["identity--not-a-uuid"], "must be a STIX identifier"),
+            (["identity--f431f809-377b-15e0-aa1c-6a4751cae5ff"], "must be a STIX identifier"),
+            (["campaign--a1a1a1a1-1a1a-4a1a-8a1a-1a1a1a1a1a1a"], "must reference one of"),
+            ([REPORT_ID], "must reference one of"),
+            (["report--a1a1a1a1-1a1a-4a1a-8a1a-1a1a1a1a1a1a"], "must reference one of"),
+        )
+        for index, (refs, message) in enumerate(cases):
+            with self.assertRaisesRegex(ValidationError, message):
+                self.add(report(report_id=REPORT2_ID, object_refs=refs), f"rep-ref-{index}")
+        self.assertEqual([], self.service.list_objects("feed", ["report"]).to_json()["objects"])
+
+    def test_report_required_properties_are_enforced(self):
+        self._seed_report_targets()
+        for field in ("name", "published", "object_refs"):
+            with self.assertRaisesRegex(ValidationError, f"report requires the {field} property"):
+                self.add(
+                    {key: value for key, value in report().items() if key != field},
+                    f"rep-req-{field}",
+                )
+
+    def test_report_property_types_are_enforced(self):
+        self._seed_report_targets()
+        bad = (
+            (dict(published="2024-03-01"), "published must look like"),
+            (dict(published=20240301), "published must be a UTC timestamp string"),
+            (dict(report_types=[]), "report_types must be a non-empty array"),
+            (dict(report_types=[""]), "report_types must be a non-empty array"),
+            (dict(report_types="threat-report"), "report_types must be a non-empty array"),
+            (dict(name=""), "name must be a non-empty string"),
+            (dict(whatever=1), "unsupported properties: whatever"),
+        )
+        for index, (overrides, message) in enumerate(bad):
+            with self.assertRaisesRegex(ValidationError, message):
+                self.add(dict(report(), **overrides), f"rep-type-{index}")
+
+    def test_report_versions_can_add_and_remove_references(self):
+        self._seed_report_targets()
+        self.add(malware(), "rep-mal", added_at="2024-01-04T00:00:00Z")
+        self.add(
+            report(modified="2024-03-01T00:00:00Z", object_refs=[INDICATOR_ID, IDENTITY_ID]),
+            "rep-v1",
+            added_at="2024-03-02T00:00:00Z",
+        )
+        self.add(
+            report(modified="2024-04-01T00:00:00Z", object_refs=[INDICATOR_ID]),
+            "rep-v2",
+            added_at="2024-04-02T00:00:00Z",
+        )
+        current = self.service.list_objects("feed", ["report"]).to_json()["objects"][0]
+        self.assertEqual("2024-04-01T00:00:00.000000Z", current["modified"])
+        self.assertEqual([INDICATOR_ID], current["object_refs"])
+
+        # A reference removed in one revision can come back in a later one.
+        self.add(
+            report(
+                modified="2024-05-01T00:00:00Z",
+                object_refs=[INDICATOR_ID, IDENTITY_ID, MALWARE_ID],
+            ),
+            "rep-v3",
+            added_at="2024-05-02T00:00:00Z",
+        )
+        versions = self.service.object_versions("feed", REPORT_ID).to_json()
+        self.assertEqual(
+            [
+                "2024-03-01T00:00:00.000000Z",
+                "2024-04-01T00:00:00.000000Z",
+                "2024-05-01T00:00:00.000000Z",
+            ],
+            versions["versions"],
+        )
+        current = self.service.list_objects("feed", ["report"]).to_json()["objects"][0]
+        self.assertEqual(
+            [INDICATOR_ID, IDENTITY_ID, MALWARE_ID], current["object_refs"]
+        )
+
+    def test_report_revision_referencing_an_unknown_target_leaves_current_intact(self):
+        self._seed_report_targets()
+        self.add(report(modified="2024-03-01T00:00:00Z"), "rep-v1")
+        with self.assertRaisesRegex(ValidationError, "report references unknown malware"):
+            self.add(
+                report(modified="2024-04-01T00:00:00Z", object_refs=[MALWARE_ID]), "rep-v2"
+            )
+        current = self.service.list_objects("feed", ["report"]).to_json()["objects"][0]
+        self.assertEqual("2024-03-01T00:00:00.000000Z", current["modified"])
+        self.assertEqual(
+            1, len(self.service.object_versions("feed", REPORT_ID).to_json()["versions"])
+        )
+
+    def test_report_version_conflicts_and_idempotency_follow_existing_rules(self):
+        self._seed_report_targets()
+        first = self.add(
+            report(modified="2024-03-01T00:00:00Z", object_refs=[IDENTITY_ID]),
+            "rep-key",
+            added_at="2024-03-02T00:00:00Z",
+        )
+        repeated = self.add(
+            report(modified="2024-03-01T00:00:00Z", object_refs=[IDENTITY_ID]),
+            "rep-key",
+            added_at="2024-03-02T00:00:00Z",
+        )
+        self.assertEqual(first, repeated)
+        with self.assertRaisesRegex(ConflictError, "already exists"):
+            self.add(report(modified="2024-03-01T00:00:00Z"), "rep-dup")
+        with self.assertRaisesRegex(ConflictError, "older than the stored version"):
+            self.add(report(modified="2024-02-01T00:00:00Z"), "rep-old")
+        self.assertEqual(
+            1, len(self.service.object_versions("feed", REPORT_ID).to_json()["versions"])
+        )
+
+    def test_report_uses_the_delta_version_and_type_filter(self):
+        self.add(indicator(), "rep-ind", added_at="2024-01-02T00:00:00Z")
+        self.add(identity(), "rep-ide", added_at="2024-01-03T00:00:00Z")
+        self.add(
+            report(modified="2024-03-01T00:00:00Z"),
+            "rep-v1",
+            added_at="2024-03-02T00:00:00Z",
+        )
+        self.assertEqual(
+            [],
+            self.service.list_objects(
+                "feed", ["report"], ["2024-03-02T00:00:00Z"]
+            ).to_json()["objects"],
+        )
+        delta = self.service.list_objects(
+            "feed", ["report"], ["2024-03-01T23:59:59Z"]
+        ).to_json()
+        self.assertEqual([REPORT_ID], [item["id"] for item in delta["objects"]])
+        self.assertEqual(["report"], delta["type"])
+
+        self.add(
+            report(modified="2024-04-01T00:00:00Z", object_refs=[INDICATOR_ID]),
+            "rep-v2",
+            added_at="2024-04-02T00:00:00Z",
+        )
+        delta = self.service.list_objects(
+            "feed", None, ["2024-04-01T00:00:00Z"]
+        ).to_json()["objects"]
+        self.assertEqual([REPORT_ID], [item["id"] for item in delta])
+        self.assertEqual([INDICATOR_ID], delta[0]["object_refs"])
+
+    def test_report_on_an_unwritable_collection_is_forbidden(self):
+        self.service.create_collection(
+            {"id": "restricted", "title": "Restricted", "can_write": False}, "cr"
+        )
+        with self.assertRaisesRegex(ForbiddenError, "collection is not writable"):
+            self.service.add_object("restricted", report(), "k1")
+        stored = self.service.add_object(
+            "feed", dict(indicator(), added_at="2024-01-02T00:00:00Z"), "k1"
+        )
+        self.assertEqual(201, stored.status)
 
     # ------------------------------------------------------------------ access
 

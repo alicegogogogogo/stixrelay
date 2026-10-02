@@ -7,11 +7,15 @@ current state and `added_after` deltas over a TAXII-shaped HTTP API.
 
 The initial release intentionally supports a compact public contract:
 
-- four object types: `identity`, `indicator`, `malware`, and `relationship`;
+- five object types: `identity`, `indicator`, `malware`, `relationship`, and
+  `report`;
 - every object is validated against a fixed property allowlist plus a required set
   that depends on its type, and its `id` must match its `type`;
 - a `relationship` can only be stored once both endpoints already exist in the
   same collection;
+- a `report` can only be stored when every entry of `object_refs` already exists
+  as the current version of an `identity`, `indicator`, `malware`, or
+  `relationship` object in the same collection;
 - revisions are append only: a newer `modified` timestamp adds a version, the
   `modified` timestamp is the TAXII version identifier, and versions never regress;
 - deltas use `added_after` as a **strictly half-open** interval over the time the
@@ -71,6 +75,7 @@ Every object carries these common properties: `type`, `spec_version`, `id`,
 | `indicator` | `name`, `pattern`, `valid_from` | `description`, `pattern_type`, `pattern_version`, `valid_until`, `indicator_types`, `kill_chain_phases` |
 | `malware` | `name`, `is_family` | `description`, `malware_types`, `aliases`, `first_seen`, `last_seen`, `kill_chain_phases` |
 | `relationship` | `relationship_type`, `source_ref`, `target_ref` | `description`, `start_time`, `stop_time` |
+| `report` | `name`, `published`, `object_refs` | `description`, `report_types` |
 
 Property rules:
 
@@ -95,7 +100,18 @@ Property rules:
   reference an `indicator` and `target_ref` must reference an `identity`. Both
   endpoints must already exist in the same collection, which is what makes the
   reference integrity check meaningful. If both `start_time` and `stop_time` are
-  given, `start_time` must not be later.
+  given, `start_time` must not be later;
+- a `report` requires `published` (a UTC timestamp in the same format as
+  `created`/`modified`) and `object_refs`: a non-empty array of STIX identifiers
+  whose type prefix is `identity`, `indicator`, `malware`, or `relationship`.
+  Entries must be well formed, must not repeat, and must not point at the report
+  itself (a `report--` identifier is rejected). The optional `report_types` is a
+  non-empty array of non-empty strings. At write time every entry must resolve to
+  the current version of an object in the **same** collection; an unknown,
+  cross-collection, duplicated, or self reference — together with an empty array —
+  is a `validation_error` and the whole submission is rejected. A later report
+  version may add or remove entries freely; each submission is checked against the
+  objects current in the collection at that moment.
 
 Any property outside the allowlist for the object's type is rejected.
 
@@ -192,8 +208,9 @@ Returns HTTP 201 with the stored object plus its storage metadata:
 
 `object` is the canonical form of the submission: `spec_version` is filled in,
 timestamps are normalised, and `pattern_type` defaults to `stix`. A mismatched
-`id` prefix, a missing required property, an unknown property, or a
-`relationship` whose endpoints do not exist is a `validation_error`.
+`id` prefix, a missing required property, an unknown property, a `relationship`
+whose endpoints do not exist, or a `report` whose `object_refs` do not resolve in
+the same collection is a `validation_error`.
 
 ### Read objects
 
@@ -288,8 +305,8 @@ Errors use this shape:
 ```
 
 Validation errors (unknown fields, unknown types, bad identifiers, bad patterns,
-missing relationship endpoints, bad `added_after`, bad `limit` or `next`,
-unsupported query parameters) return 400. Writes to a read-only collection
+missing relationship endpoints, unresolvable report `object_refs`, bad
+`added_after`, bad `limit` or `next`, unsupported query parameters) return 400. Writes to a read-only collection
 return 403 (`forbidden`). Missing collections and objects — and any access to a
 collection with `can_read: false` — return 404. Version conflicts, duplicate
 collections, and idempotency key reuse return 409.
