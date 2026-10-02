@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from . import cursor
 from .errors import ConflictError, NotFoundError, ValidationError
 from .model import (
     MEDIA_TYPE,
@@ -90,6 +92,19 @@ class StixRelay:
             raise ValidationError("added_after must be supplied exactly once")
         value = raw[0].replace(" ", "T", 1) if " " in raw[0] else raw[0]
         return canonical_timestamp(value, "added_after")
+
+    def _limit(self, raw: Any) -> int | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or len(raw) != 1:
+            raise ValidationError("limit must be supplied exactly once")
+        value = raw[0]
+        if not isinstance(value, str) or re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+            raise ValidationError("limit must be a decimal integer between 1 and 200")
+        page_size = int(value)
+        if not 1 <= page_size <= 200:
+            raise ValidationError("limit must be a decimal integer between 1 and 200")
+        return page_size
 
     def _require_collection(self, collection_id: str) -> dict[str, Any]:
         row = self.store.connection.execute(
@@ -218,12 +233,50 @@ class StixRelay:
         return self._idempotent(key, f"add-object:{collection_id}:{stix_object.id}", create)
 
     def list_objects(
-        self, collection_id: str, type_filter: Any = None, added_after: Any = None
+        self,
+        collection_id: str,
+        type_filter: Any = None,
+        added_after: Any = None,
+        *,
+        limit: Any = None,
+        next_token: Any = None,
     ) -> Result:
         self._require_collection(collection_id)
+        token = self._next_token(next_token)
+        if token is not None:
+            if type_filter is not None or added_after is not None or limit is not None:
+                raise ValidationError("next must be supplied without type, added_after, or limit")
+            return self._continue_snapshot(collection_id, token)
+
         requested = self._identity(type_filter) if type_filter is not None else None
         cutoff = self._added_after(added_after)
+        page_size = self._limit(limit)
+        documents = self._current_documents(
+            self.store.connection, collection_id, requested, cutoff
+        )
 
+        if page_size is None:
+            payload: dict[str, Any] = {"objects": documents, "more": False}
+            if requested is not None:
+                payload["type"] = list(requested)
+            return Result(payload, 200)
+        return self._start_snapshot(collection_id, requested, page_size, documents)
+
+    def _next_token(self, raw: Any) -> str | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], str):
+            raise ValidationError("next is not a valid cursor for this service")
+        return raw[0]
+
+    def _current_documents(
+        self,
+        connection: Any,
+        collection_id: str,
+        requested: tuple[str, ...] | None,
+        cutoff: str | None,
+    ) -> list[dict[str, Any]]:
+        """Latest readable revision of every object, in the stable listing order."""
         sql = (
             "SELECT document, added_at FROM ("
             "  SELECT document, added_at, type,"
@@ -237,16 +290,92 @@ class StixRelay:
             sql += f" AND type IN ({placeholders})"
             parameters.extend(requested)
         sql += " ORDER BY added_at, json_extract(document, '$.id')"
-        rows = self.store.connection.execute(sql, parameters).fetchall()
+        rows = connection.execute(sql, parameters).fetchall()
 
-        objects: list[dict[str, Any]] = []
+        documents: list[dict[str, Any]] = []
         for row in rows:
             if cutoff is not None and timestamp_value(row["added_at"]) <= timestamp_value(cutoff):
                 continue
-            objects.append(self.store.decode(row["document"]))
-        payload: dict[str, Any] = {"objects": objects, "more": False}
-        if requested is not None:
-            payload["type"] = list(requested)
+            documents.append(self.store.decode(row["document"]))
+        return documents
+
+    def _start_snapshot(
+        self,
+        collection_id: str,
+        requested: tuple[str, ...] | None,
+        page_size: int,
+        documents: list[dict[str, Any]],
+    ) -> Result:
+        """Freeze the current result set so later writes stay out of this round."""
+        type_echo = self.store.encode(list(requested)) if requested is not None else None
+        with self.store.transaction() as connection:
+            snapshot_id = connection.execute(
+                "INSERT INTO snapshots(collection_id, created_at, limit_value, type_filter)"
+                " VALUES (?, ?, ?, ?)",
+                (collection_id, self.store.now(), page_size, type_echo),
+            ).lastrowid
+            connection.executemany(
+                "INSERT INTO snapshot_entries(snapshot_id, position, document) VALUES (?, ?, ?)",
+                [
+                    (snapshot_id, position, self.store.encode(document))
+                    for position, document in enumerate(documents)
+                ],
+            )
+            total = len(documents)
+            rows = connection.execute(
+                "SELECT document FROM snapshot_entries WHERE snapshot_id = ?"
+                " ORDER BY position LIMIT ?",
+                (snapshot_id, page_size),
+            ).fetchall()
+        return self._page_result(snapshot_id, collection_id, type_echo, 0, rows, total)
+
+    def _continue_snapshot(self, collection_id: str, token: str) -> Result:
+        snapshot_id, offset = cursor.decode(self.store.cursor_secret, token, collection_id)
+        snapshot = self.store.connection.execute(
+            "SELECT id, collection_id, limit_value, type_filter FROM snapshots WHERE id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if snapshot is None or snapshot["collection_id"] != collection_id:
+            raise ValidationError("next is not a valid cursor for this service")
+        total = self.store.connection.execute(
+            "SELECT COUNT(*) AS count FROM snapshot_entries WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()["count"]
+        if offset >= total:
+            raise ValidationError("next cursor has no remaining pages")
+        rows = self.store.connection.execute(
+            "SELECT document FROM snapshot_entries WHERE snapshot_id = ?"
+            " ORDER BY position LIMIT ? OFFSET ?",
+            (snapshot_id, snapshot["limit_value"], offset),
+        ).fetchall()
+        return self._page_result(
+            snapshot_id,
+            snapshot["collection_id"],
+            snapshot["type_filter"],
+            offset,
+            rows,
+            total,
+        )
+
+    def _page_result(
+        self,
+        snapshot_id: int,
+        collection_id: str,
+        type_filter: str | None,
+        offset: int,
+        rows: list[Any],
+        total: int,
+    ) -> Result:
+        objects = [self.store.decode(row["document"]) for row in rows]
+        next_offset = offset + len(objects)
+        more = next_offset < total
+        payload: dict[str, Any] = {"objects": objects, "more": more}
+        if type_filter is not None:
+            payload["type"] = self.store.decode(type_filter)
+        if more:
+            payload["next"] = cursor.encode(
+                self.store.cursor_secret, snapshot_id, next_offset, collection_id
+            )
         return Result(payload, 200)
 
     def object_versions(self, collection_id: str, object_id: str) -> Result:

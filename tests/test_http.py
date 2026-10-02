@@ -165,6 +165,143 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(400, status)
         self.assertEqual("validation_error", body["error"]["code"])
 
+    def test_pagination_walks_every_page_and_freezes_the_snapshot(self):
+        self.request("POST", "/taxii2/collections", {"id": "p1", "title": "Paged"}, "p0")
+        for number, object_id in enumerate(
+            (
+                "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f01",
+                "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f02",
+                "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f03",
+            ),
+            start=1,
+        ):
+            payload = dict(indicator(), id=object_id, name=f"Paged {number}")
+            payload["added_at"] = f"2024-04-{number:02d}T00:00:00Z"
+            status, _ = self.request(
+                "POST", "/taxii2/collections/p1/objects/", payload, f"p{number}"
+            )
+            self.assertEqual(201, status)
+
+        status, first = self.request(
+            "GET", "/taxii2/collections/p1/objects/?type=indicator&limit=2"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["Paged 1", "Paged 2"], [item["name"] for item in first["objects"]])
+        self.assertTrue(first["more"])
+        self.assertEqual(["indicator"], first["type"])
+        self.assertIn("next", first)
+
+        # An object arriving mid-walk does not enter the open snapshot.
+        late = dict(
+            indicator(),
+            id="indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f04",
+            name="Paged 4",
+            added_at="2024-05-01T00:00:00Z",
+        )
+        self.request("POST", "/taxii2/collections/p1/objects/", late, "p4")
+
+        status, second = self.request(
+            "GET", f"/taxii2/collections/p1/objects/?next={first['next']}"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["Paged 3"], [item["name"] for item in second["objects"]])
+        self.assertFalse(second["more"])
+        self.assertNotIn("next", second)
+        self.assertEqual(["indicator"], second["type"])
+
+        # Replaying the same cursor repeats the remaining page, not the first.
+        status, replayed = self.request(
+            "GET", f"/taxii2/collections/p1/objects/?next={first['next']}"
+        )
+        self.assertEqual(second["objects"], replayed["objects"])
+
+        # Restarting from page one sees the late object.
+        status, restarted = self.request(
+            "GET", "/taxii2/collections/p1/objects/?limit=10"
+        )
+        self.assertEqual(4, len(restarted["objects"]))
+        self.assertFalse(restarted["more"])
+
+    def test_legacy_objects_call_has_no_pagination_fields(self):
+        self.request("POST", "/taxii2/collections", {"id": "p2", "title": "Legacy"}, "pl0")
+        payload = dict(malware(), added_at="2024-06-01T00:00:00Z")
+        self.request("POST", "/taxii2/collections/p2/objects/", payload, "pl1")
+        status, body = self.request("GET", "/taxii2/collections/p2/objects/")
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(body["objects"]))
+        self.assertFalse(body["more"])
+        self.assertNotIn("next", body)
+        self.assertNotIn("type", body)
+
+    def test_limit_validation_errors(self):
+        self.request("POST", "/taxii2/collections", {"id": "pv", "title": "Limit"}, "pv0")
+        for value in ("0", "201", "01", "-1", "1.5", "abc", "%201", "1%20"):
+            status, body = self.request(
+                "GET", f"/taxii2/collections/pv/objects/?limit={value}"
+            )
+            self.assertEqual(400, status, value)
+            self.assertEqual("validation_error", body["error"]["code"], value)
+        status, body = self.request(
+            "GET", "/taxii2/collections/pv/objects/?limit=1&limit=2"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+
+    def test_next_validation_errors(self):
+        self.request("POST", "/taxii2/collections", {"id": "p3", "title": "Cursors"}, "pc0")
+        self.request(
+            "POST",
+            "/taxii2/collections/p3/objects/",
+            dict(malware(), added_at="2024-07-01T00:00:00Z"),
+            "pc1",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections/p3/objects/",
+            dict(
+                indicator(),
+                id="indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f09",
+                added_at="2024-07-02T00:00:00Z",
+            ),
+            "pc2",
+        )
+        _, first = self.request("GET", "/taxii2/collections/p3/objects/?limit=1")
+        token = first["next"]
+        flipped = token[:-1] + ("B" if token[-1] == "A" else "A")
+
+        for query, label in (
+            (f"next={token}&type=malware", "with type"),
+            (f"next={token}&added_after=2024-01-01T00:00:00Z", "with added_after"),
+            (f"next={token}&limit=1", "with limit"),
+            ("next=not-a-real-cursor", "malformed"),
+            (f"next={flipped}", "tampered"),
+        ):
+            status, body = self.request("GET", f"/taxii2/collections/p3/objects/?{query}")
+            self.assertEqual(400, status, label)
+            self.assertEqual("validation_error", body["error"]["code"], label)
+
+        status, body = self.request("GET", f"/taxii2/collections/p3/objects/?next={token}&next={token}")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+
+        self.request("POST", "/taxii2/collections", {"id": "p4", "title": "Other"}, "pc3")
+        status, body = self.request("GET", f"/taxii2/collections/p4/objects/?next={token}")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+
+    def test_unknown_query_parameter_is_still_rejected(self):
+        self.request("POST", "/taxii2/collections", {"id": "p5", "title": "Unknowns"}, "pu0")
+        status, body = self.request(
+            "GET", "/taxii2/collections/p5/objects/?limit=1&cursor=x"
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+
+    def test_pagination_keeps_not_found_semantics(self):
+        status, body = self.request("GET", "/taxii2/collections/missing/objects/?limit=1")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", body["error"]["code"])
+
 
 if __name__ == "__main__":
     unittest.main()

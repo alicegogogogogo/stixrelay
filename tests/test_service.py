@@ -318,6 +318,170 @@ class StixRelayTests(unittest.TestCase):
             [IDENTITY_ID], [item["id"] for item in reopened.list_objects("feed").to_json()["objects"]]
         )
 
+    # --------------------------------------------------------------- pagination
+
+    PAGE_INDICATOR_IDS = (
+        "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f01",
+        "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f02",
+        "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f03",
+        "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f04",
+        "indicator--a2f4b7d8-2c7e-4a4b-9d0e-0f6a1c9d3f05",
+    )
+
+    def _paged_indicator(self, number: int, **overrides) -> dict:
+        payload = indicator()
+        payload["id"] = self.PAGE_INDICATOR_IDS[number - 1]
+        payload["name"] = f"Indicator {number}"
+        payload.update(overrides)
+        return payload
+
+    def _seed_indicators(self, count: int, *, key_prefix: str = "ind"):
+        for number in range(1, count + 1):
+            self.add(
+                self._paged_indicator(number),
+                f"{key_prefix}-{number}",
+                added_at=f"2024-02-{number:02d}T00:00:00Z",
+            )
+
+    def test_legacy_listing_without_limit_is_unchanged(self):
+        self._seed_indicators(3)
+        page = self.service.list_objects("feed", ["indicator"], ["2024-01-01T00:00:00Z"]).to_json()
+        self.assertEqual(3, len(page["objects"]))
+        self.assertFalse(page["more"])
+        self.assertNotIn("next", page)
+        self.assertEqual(["indicator"], page["type"])
+
+    def test_limit_paginates_in_stable_order(self):
+        self._seed_indicators(5)
+        first = self.service.list_objects("feed", limit=["2"]).to_json()
+        self.assertEqual(
+            [1, 2], [int(item["name"].rsplit(" ", 1)[1]) for item in first["objects"]]
+        )
+        self.assertTrue(first["more"])
+        self.assertIn("next", first)
+
+        seen = [item["id"] for item in first["objects"]]
+        token = first["next"]
+        for expected_size, more in ((2, True), (1, False)):
+            page = self.service.list_objects("feed", next_token=[token]).to_json()
+            self.assertEqual(expected_size, len(page["objects"]))
+            self.assertEqual(more, page["more"])
+            seen.extend(item["id"] for item in page["objects"])
+            token = page.get("next")
+        self.assertEqual(5, len(seen))
+        self.assertEqual(len(set(seen)), len(seen))
+        self.assertIsNone(token)
+
+    def test_limit_equal_to_total_has_no_next(self):
+        self._seed_indicators(2)
+        page = self.service.list_objects("feed", limit=["2"]).to_json()
+        self.assertEqual(2, len(page["objects"]))
+        self.assertFalse(page["more"])
+        self.assertNotIn("next", page)
+
+    def test_type_and_added_after_are_remembered_by_the_cursor(self):
+        self._seed_indicators(3)
+        self.add(identity(), "identity-page", added_at="2024-02-05T00:00:00Z")
+        first = self.service.list_objects(
+            "feed", ["indicator"], ["2024-02-01T00:00:00Z"], limit=["1"]
+        ).to_json()
+        self.assertEqual(["indicator"], first["type"])
+        # The cutoff excludes indicator 1 (added 2024-02-01, equal to cutoff).
+        self.assertEqual("Indicator 2", first["objects"][0]["name"])
+        second = self.service.list_objects("feed", next_token=[first["next"]]).to_json()
+        self.assertEqual(["indicator"], second["type"])
+        self.assertEqual("Indicator 3", second["objects"][0]["name"])
+        self.assertFalse(second["more"])
+
+    def test_cursor_replays_its_snapshot_not_the_first_page(self):
+        self._seed_indicators(3)
+        first = self.service.list_objects("feed", limit=["2"]).to_json()
+        second = self.service.list_objects("feed", next_token=[first["next"]]).to_json()
+        replayed = self.service.list_objects("feed", next_token=[first["next"]]).to_json()
+        self.assertEqual(second["objects"], replayed["objects"])
+        self.assertEqual(second.get("next"), replayed.get("next"))
+
+    def test_new_objects_and_revisions_stay_out_of_an_open_snapshot(self):
+        self._seed_indicators(2)
+        first = self.service.list_objects("feed", limit=["1"]).to_json()
+        # A revision and a brand new object arrive after the snapshot began.
+        self.add(
+            self._paged_indicator(1, modified="2024-05-01T00:00:00Z", name="Indicator 1 v2"),
+            "ind-1-v2",
+            added_at="2024-05-02T00:00:00Z",
+        )
+        self.add(
+            self._paged_indicator(3),
+            "ind-late-3",
+            added_at="2024-05-03T00:00:00Z",
+        )
+        second = self.service.list_objects("feed", next_token=[first["next"]]).to_json()
+        self.assertEqual(1, len(second["objects"]))
+        self.assertFalse(second["more"])
+        self.assertEqual("Indicator 2", second["objects"][0]["name"])
+        fresh = self.service.list_objects("feed", limit=["10"]).to_json()
+        self.assertEqual(
+            ["Indicator 2", "Indicator 1 v2", "Indicator 3"],
+            [item["name"] for item in fresh["objects"]],
+        )
+
+    def test_snapshot_survives_a_restart(self):
+        path = str(Path(self.directory.name) / "paged.db")
+        service = StixRelay(path)
+        service.create_collection({"id": "feed", "title": "Primary feed"}, "c1")
+        service.add_object("feed", dict(indicator(), added_at="2024-01-02T00:00:00Z"), "k1")
+        service.add_object(
+            "feed",
+            dict(indicator(), id=self.PAGE_INDICATOR_IDS[1], added_at="2024-01-03T00:00:00Z"),
+            "k2",
+        )
+        first = service.list_objects("feed", limit=["1"]).to_json()
+        reopened = StixRelay(path)
+        page = reopened.list_objects("feed", next_token=[first["next"]]).to_json()
+        self.assertEqual(1, len(page["objects"]))
+        self.assertFalse(page["more"])
+
+    def test_limit_validation(self):
+        for value in ("0", "201", "01", "-1", "1.0", "abc", "1 ", ""):
+            with self.assertRaisesRegex(ValidationError, "limit must be a decimal integer"):
+                self.service.list_objects("feed", limit=[value])
+        with self.assertRaisesRegex(ValidationError, "limit must be supplied exactly once"):
+            self.service.list_objects("feed", limit=["1", "2"])
+
+    def test_next_cannot_mix_with_other_parameters(self):
+        with self.assertRaisesRegex(ValidationError, "without type, added_after, or limit"):
+            self.service.list_objects("feed", ["indicator"], next_token=["x"])
+        with self.assertRaisesRegex(ValidationError, "without type, added_after, or limit"):
+            self.service.list_objects("feed", None, ["2024-01-01T00:00:00Z"], next_token=["x"])
+        with self.assertRaisesRegex(ValidationError, "without type, added_after, or limit"):
+            self.service.list_objects("feed", limit=["1"], next_token=["x"])
+
+    def test_next_must_be_supplied_once(self):
+        with self.assertRaisesRegex(ValidationError, "not a valid cursor"):
+            self.service.list_objects("feed", next_token=["a", "b"])
+
+    def test_tampered_or_foreign_cursors_are_rejected(self):
+        self._seed_indicators(2)
+        token = self.service.list_objects("feed", limit=["1"]).to_json()["next"]
+        with self.assertRaisesRegex(ValidationError, "not a valid cursor"):
+            self.service.list_objects("feed", next_token=["garbage"])
+        flipped = token[:-1] + ("A" if token[-1] != "A" else "B")
+        with self.assertRaisesRegex(ValidationError, "modified or was not issued"):
+            self.service.list_objects("feed", next_token=[flipped])
+        self.service.create_collection({"id": "other", "title": "Other"}, "co")
+        with self.assertRaisesRegex(ValidationError, "does not belong to this collection"):
+            self.service.list_objects("other", next_token=[token])
+        with self.assertRaisesRegex(ValidationError, "not a valid cursor"):
+            self.service.list_objects("feed", next_token=[None])
+
+    def test_cursor_signed_by_another_service_is_rejected(self):
+        self._seed_indicators(2)
+        other = StixRelay(str(Path(self.directory.name) / "other-secret.db"))
+        from stixrelay import cursor as cursor_module
+        token = cursor_module.encode(other.store.cursor_secret, 1, 1, "feed")
+        with self.assertRaisesRegex(ValidationError, "modified or was not issued"):
+            self.service.list_objects("feed", next_token=[token])
+
 
 if __name__ == "__main__":
     unittest.main()

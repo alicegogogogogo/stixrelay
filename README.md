@@ -191,7 +191,7 @@ timestamps are normalised, and `pattern_type` defaults to `stix`. A mismatched
 GET /taxii2/collections/feed/objects/?type=indicator,malware&added_after=2024-01-01T00:00:00Z
 ```
 
-Both query parameters are optional and may appear at most once.
+The filter query parameters are optional and may appear at most once.
 
 - `type` is a comma separated list of supported object types; only those types are
   returned and the applied list is echoed back in `type`;
@@ -207,7 +207,47 @@ Both query parameters are optional and may appear at most once.
 {"objects":[{"type":"identity","id":"identity--...","...":"..."}],"more":false,"type":["identity"]}
 ```
 
-`more` is always `false`: this release never paginates.
+A request without `limit` (and without `next`) is the legacy, un-paginated read: it
+returns every matching current revision, `more` is always `false`, and no `next` is
+present.
+
+### Cursor pagination
+
+Add `limit` to page through a large collection instead of receiving every object at
+once:
+
+```http
+GET /taxii2/collections/feed/objects/?limit=100
+```
+
+`limit` is a decimal integer between `1` and `200` and may appear at most once. The
+first request takes the normal read path, so `type` and `added_after` keep their
+exact existing semantics.
+
+- each response keeps `objects` and `more`; when a `type` filter was applied, the
+  applied list is echoed in `type` on every page;
+- while the current ordering has more rows, `more` is `true` and the response adds
+  `next`, an opaque URL-safe cursor; on the last page `more` is `false` and `next`
+  is absent;
+- follow-up requests send **only** `next` — repeating `type`, `added_after`, or
+  `limit` together with `next` is a `validation_error`. The server remembers the
+  filter and page size from the first request:
+
+```http
+GET /taxii2/collections/feed/objects/?next=v1.AbCd...
+```
+
+- objects are ordered stably by `added_at` and then object id; each object appears
+  at most once, showing only the newest revision readable in the pagination round;
+- the first paged request establishes a **snapshot**. Objects and revisions
+  received afterwards never enter that round's pages; they only become visible when
+  a new round starts from page one. Replaying the same cursor re-reads the
+  remaining pages of its own snapshot rather than restarting at the first page.
+
+`limit` that is not a decimal integer, is below `1`, above `200`, or appears more
+than once is a `validation_error`. `next` that is repeated, malformed, issued by
+another service, modified, bound to another collection, or combined with `type`,
+`added_after`, or `limit` is also a `validation_error`.
 
 ### Read object versions
 
@@ -238,9 +278,10 @@ Errors use this shape:
 ```
 
 Validation errors (unknown fields, unknown types, bad identifiers, bad patterns,
-missing relationship endpoints, bad `added_after`, unsupported query parameters)
-return 400. Missing collections and objects return 404. Version conflicts,
-duplicate collections, and idempotency key reuse return 409.
+missing relationship endpoints, bad `added_after`, bad `limit` or `next`,
+unsupported query parameters) return 400. Missing collections and objects return
+404. Version conflicts, duplicate collections, and idempotency key reuse return
+409.
 
 ## Tests
 
