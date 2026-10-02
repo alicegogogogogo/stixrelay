@@ -9,6 +9,7 @@ IDENTITY_ID = "identity--f431f809-377b-45e0-aa1c-6a4751cae5ff"
 INDICATOR_ID = "indicator--a2f4b7d8-2c7e-4a4b-9d0e-6f6a1c9d3f21"
 MALWARE_ID = "malware--3c9d1e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
 RELATIONSHIP_ID = "relationship--b6a1e2c3-1f2a-4b3c-8d4e-5f6a7b8c9d0e"
+REPORT_ID = "report--c7b2f3d4-2a3b-4c5d-9e0f-1a2b3c4d5e6f"
 
 CREATED = "2024-01-01T00:00:00Z"
 
@@ -62,6 +63,19 @@ def relationship(*, modified: str = CREATED) -> dict:
         "relationship_type": "indicates",
         "source_ref": INDICATOR_ID,
         "target_ref": IDENTITY_ID,
+    }
+
+
+def report(*, modified: str = CREATED, object_refs: list = None) -> dict:
+    return {
+        "type": "report",
+        "spec_version": "2.1",
+        "id": REPORT_ID,
+        "created": CREATED,
+        "modified": modified,
+        "name": "Quarterly roundup",
+        "published": CREATED,
+        "object_refs": object_refs if object_refs is not None else [INDICATOR_ID],
     }
 
 
@@ -184,6 +198,107 @@ class StixRelayTests(unittest.TestCase):
         self.add(relationship(), "k3")
         with self.assertRaisesRegex(ConflictError, "already exists"):
             self.add(relationship(), "k4")
+
+    # ------------------------------------------------------------------- report
+
+    def test_report_round_trip(self):
+        self.add(indicator(), "k1")
+        self.add(identity(), "k2")
+        stored = self.add(report(object_refs=[INDICATOR_ID, IDENTITY_ID]), "k3")
+        self.assertEqual("2024-01-01T00:00:00.000000Z", stored["object"]["published"])
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID], stored["object"]["object_refs"])
+        listed = self.service.list_objects("feed", ["report"]).to_json()
+        self.assertEqual([stored["object"]], listed["objects"])
+        self.assertEqual(["report"], listed["type"])
+
+    def test_report_optional_properties(self):
+        self.add(indicator(), "k1")
+        payload = dict(report(), description="All about hashes", report_types=["threat-report"])
+        stored = self.add(payload, "k2")
+        self.assertEqual("All about hashes", stored["object"]["description"])
+        self.assertEqual(["threat-report"], stored["object"]["report_types"])
+
+    def test_report_required_properties_are_enforced(self):
+        for name in ("name", "published", "object_refs"):
+            payload = {key: value for key, value in report().items() if key != name}
+            with self.assertRaisesRegex(ValidationError, f"report requires the {name} property"):
+                self.add(payload, f"k-{name}")
+
+    def test_report_property_types_are_enforced(self):
+        with self.assertRaisesRegex(ValidationError, "published must be a UTC timestamp"):
+            self.add(dict(report(), published=12345), "k1")
+        with self.assertRaisesRegex(ValidationError, "published must look like"):
+            self.add(dict(report(), published="2024-01-02 03:04:05"), "k2")
+        with self.assertRaisesRegex(ValidationError, "published is not a valid calendar timestamp"):
+            self.add(dict(report(), published="2024-13-40T00:00:00Z"), "k2b")
+        with self.assertRaisesRegex(ValidationError, "report_types must be a non-empty array"):
+            self.add(dict(report(), report_types=[]), "k3")
+        with self.assertRaisesRegex(ValidationError, "report has unsupported properties: labels2"):
+            self.add(dict(report(), labels2=["x"]), "k4")
+
+    def test_report_object_refs_shape_is_validated(self):
+        with self.assertRaisesRegex(ValidationError, "object_refs must be a non-empty array"):
+            self.add(report(object_refs=[]), "k1")
+        with self.assertRaisesRegex(ValidationError, "object_refs\\[0\\] must be a STIX identifier"):
+            self.add(report(object_refs=["not-an-id"]), "k2")
+        with self.assertRaisesRegex(ValidationError, "object_refs\\[0\\] must reference one of"):
+            self.add(report(object_refs=[REPORT_ID.replace("c7b2f3d4", "c7b2f3d5")]), "k3")
+        with self.assertRaisesRegex(ValidationError, "duplicates an earlier object_refs entry"):
+            self.add(report(object_refs=[INDICATOR_ID, INDICATOR_ID]), "k4")
+
+    def test_report_must_not_reference_itself(self):
+        # A report id carries the report-- prefix, which object_refs never accepts,
+        # so pointing a report at itself (or any other report) is a validation error.
+        with self.assertRaisesRegex(ValidationError, "must reference one of"):
+            self.add(report(object_refs=[REPORT_ID]), "k1")
+
+    def test_report_refs_must_exist_in_the_same_collection(self):
+        with self.assertRaisesRegex(ValidationError, "report references unknown indicator"):
+            self.add(report(), "k1")
+        # The target existing in another collection does not count.
+        self.service.create_collection({"id": "other", "title": "Other"}, "c2")
+        self.service.add_object(
+            "other", dict(indicator(), added_at="2024-01-02T00:00:00Z"), "k2"
+        )
+        with self.assertRaisesRegex(ValidationError, "report references unknown indicator"):
+            self.add(report(), "k3")
+        self.assertEqual([], self.service.list_objects("feed").to_json()["objects"])
+
+    def test_report_new_version_may_change_refs(self):
+        self.add(indicator(), "k1")
+        self.add(report(), "k2")
+        self.add(identity(), "k3")
+        self.add(
+            report(modified="2024-02-01T00:00:00Z", object_refs=[INDICATOR_ID, IDENTITY_ID]),
+            "k4",
+        )
+        versions = self.service.object_versions("feed", REPORT_ID).to_json()
+        self.assertEqual(
+            ["2024-01-01T00:00:00.000000Z", "2024-02-01T00:00:00.000000Z"],
+            versions["versions"],
+        )
+        document = self.service.list_objects("feed", ["report"]).to_json()["objects"][0]
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID], document["object_refs"])
+
+    def test_report_new_version_validates_against_current_objects(self):
+        self.add(indicator(), "k1")
+        self.add(report(), "k2")
+        with self.assertRaisesRegex(ValidationError, "report references unknown malware"):
+            self.add(
+                report(modified="2024-02-01T00:00:00Z", object_refs=[INDICATOR_ID, MALWARE_ID]),
+                "k3",
+            )
+        versions = self.service.object_versions("feed", REPORT_ID).to_json()
+        self.assertEqual(["2024-01-01T00:00:00.000000Z"], versions["versions"])
+
+    def test_report_version_rules_are_unchanged(self):
+        self.add(indicator(), "k1")
+        self.add(report(modified="2024-02-01T00:00:00Z"), "k2")
+        with self.assertRaisesRegex(ConflictError, "already exists"):
+            self.add(report(modified="2024-02-01T00:00:00Z"), "k3")
+        with self.assertRaisesRegex(ConflictError, "is older than the stored version"):
+            self.add(report(), "k4")
+
 
     def test_new_version_is_appended_and_old_version_is_read_only(self):
         self.add(identity(), "k1", added_at="2024-01-02T00:00:00Z")

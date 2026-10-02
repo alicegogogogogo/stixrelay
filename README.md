@@ -7,11 +7,13 @@ current state and `added_after` deltas over a TAXII-shaped HTTP API.
 
 The initial release intentionally supports a compact public contract:
 
-- four object types: `identity`, `indicator`, `malware`, and `relationship`;
+- five object types: `identity`, `indicator`, `malware`, `relationship`, and
+  `report`;
 - every object is validated against a fixed property allowlist plus a required set
   that depends on its type, and its `id` must match its `type`;
 - a `relationship` can only be stored once both endpoints already exist in the
-  same collection;
+  same collection, and every `report` entry in `object_refs` must likewise
+  reference an object that already exists in the same collection;
 - revisions are append only: a newer `modified` timestamp adds a version, the
   `modified` timestamp is the TAXII version identifier, and versions never regress;
 - deltas use `added_after` as a **strictly half-open** interval over the time the
@@ -71,6 +73,7 @@ Every object carries these common properties: `type`, `spec_version`, `id`,
 | `indicator` | `name`, `pattern`, `valid_from` | `description`, `pattern_type`, `pattern_version`, `valid_until`, `indicator_types`, `kill_chain_phases` |
 | `malware` | `name`, `is_family` | `description`, `malware_types`, `aliases`, `first_seen`, `last_seen`, `kill_chain_phases` |
 | `relationship` | `relationship_type`, `source_ref`, `target_ref` | `description`, `start_time`, `stop_time` |
+| `report` | `name`, `published`, `object_refs` | `description`, `report_types` |
 
 Property rules:
 
@@ -95,7 +98,15 @@ Property rules:
   reference an `indicator` and `target_ref` must reference an `identity`. Both
   endpoints must already exist in the same collection, which is what makes the
   reference integrity check meaningful. If both `start_time` and `stop_time` are
-  given, `start_time` must not be later.
+  given, `start_time` must not be later;
+- a `report` carries `published` as a UTC timestamp and `object_refs` as a
+  non-empty array of STIX identifiers whose prefixes are limited to `identity`,
+  `indicator`, `malware`, and `relationship` — a report can never reference
+  another report, including itself. Entries must not repeat, and every entry
+  must already exist in the same collection at submit time; a new version of a
+  report may add or drop references and is checked against the collection's
+  current objects. `report_types`, when present, is a non-empty array of
+  non-empty strings.
 
 Any property outside the allowlist for the object's type is rejected.
 
