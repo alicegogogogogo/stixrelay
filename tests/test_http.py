@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from stixrelay.server import Handler
 from stixrelay.service import StixRelay
-from test_service import IDENTITY_ID, MALWARE_ID, identity, indicator, malware
+from test_service import IDENTITY_ID, INDICATOR_ID, MALWARE_ID, identity, indicator, malware
 
 IDENTITY_ADDED_AT = "2024-01-02T00:00:00Z"
 IDENTITY_VERSION = "2024-01-01T00:00:00.000000Z"
@@ -164,6 +164,64 @@ class HttpTests(unittest.TestCase):
                 error.close()
         self.assertEqual(400, status)
         self.assertEqual("validation_error", body["error"]["code"])
+
+    def test_paginated_walk_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "f5", "title": "Feed five"}, "h11")
+        for index, payload in enumerate((identity(), indicator(), malware())):
+            status, _ = self.request(
+                "POST",
+                "/taxii2/collections/f5/objects/",
+                dict(payload, added_at=f"2024-01-0{index + 2}T00:00:00Z"),
+                f"h12-{index}",
+            )
+            self.assertEqual(201, status)
+
+        status, first = self.request("GET", "/taxii2/collections/f5/objects/?limit=2")
+        self.assertEqual(200, status)
+        self.assertEqual([IDENTITY_ID, INDICATOR_ID], [item["id"] for item in first["objects"]])
+        self.assertTrue(first["more"])
+        self.assertIsInstance(first["next"], str)
+
+        status, second = self.request(
+            "GET", f"/taxii2/collections/f5/objects/?next={first['next']}"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([MALWARE_ID], [item["id"] for item in second["objects"]])
+        self.assertFalse(second["more"])
+        self.assertNotIn("next", second)
+
+    def test_pagination_type_echo_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "f6", "title": "Feed six"}, "h13")
+        self.request(
+            "POST", "/taxii2/collections/f6/objects/",
+            dict(identity(), added_at="2024-01-02T00:00:00Z"), "h14",
+        )
+        self.request(
+            "POST", "/taxii2/collections/f6/objects/",
+            dict(malware(), added_at="2024-01-03T00:00:00Z"), "h15",
+        )
+        status, first = self.request(
+            "GET", "/taxii2/collections/f6/objects/?type=malware&limit=1"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["malware"], first["type"])
+        self.assertEqual([MALWARE_ID], [item["id"] for item in first["objects"]])
+        self.assertFalse(first["more"])
+
+    def test_pagination_rejects_bad_parameters_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "f7", "title": "Feed seven"}, "h16")
+        for path in (
+            "/taxii2/collections/f7/objects/?limit=0",
+            "/taxii2/collections/f7/objects/?limit=201",
+            "/taxii2/collections/f7/objects/?limit=abc",
+            "/taxii2/collections/f7/objects/?limit=1&limit=2",
+            "/taxii2/collections/f7/objects/?next=bogus",
+            "/taxii2/collections/f7/objects/?next=bogus&limit=1",
+            "/taxii2/collections/f7/objects/?next=bogus&type=identity",
+        ):
+            status, body = self.request("GET", path)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", body["error"]["code"], path)
 
 
 if __name__ == "__main__":

@@ -318,6 +318,145 @@ class StixRelayTests(unittest.TestCase):
             [IDENTITY_ID], [item["id"] for item in reopened.list_objects("feed").to_json()["objects"]]
         )
 
+    # ------------------------------------------------------------- pagination
+
+    def add_three(self):
+        self.add(identity(), "k1", added_at="2024-01-02T00:00:00Z")
+        self.add(indicator(), "k2", added_at="2024-01-02T00:00:00Z")
+        self.add(malware(), "k3", added_at="2024-01-03T00:00:00Z")
+
+    def walk(self, first):
+        pages = [first]
+        while pages[-1]["more"]:
+            pages.append(self.service.list_objects("feed", cursor=[pages[-1]["next"]]).to_json())
+        return pages
+
+    def test_paginated_walk_visits_each_object_once_in_stable_order(self):
+        self.add_three()
+        pages = self.walk(self.service.list_objects("feed", limit=["1"]).to_json())
+        self.assertEqual(3, len(pages))
+        seen = [item["id"] for page in pages for item in page["objects"]]
+        self.assertEqual([IDENTITY_ID, INDICATOR_ID, MALWARE_ID], seen)
+        self.assertTrue(all(page["more"] for page in pages[:-1]))
+        self.assertFalse(pages[-1]["more"])
+        self.assertNotIn("next", pages[-1])
+        self.assertTrue(all("next" in page for page in pages[:-1]))
+
+    def test_pagination_remembers_type_filter_and_page_size(self):
+        self.add_three()
+        first = self.service.list_objects("feed", ["identity", "malware"], limit=["1"]).to_json()
+        self.assertEqual(["identity", "malware"], first["type"])
+        self.assertEqual([IDENTITY_ID], [item["id"] for item in first["objects"]])
+        second = self.service.list_objects("feed", cursor=[first["next"]]).to_json()
+        self.assertEqual(["identity", "malware"], second["type"])
+        self.assertEqual([MALWARE_ID], [item["id"] for item in second["objects"]])
+        self.assertFalse(second["more"])
+
+    def test_pagination_remembers_added_after_as_strictly_half_open(self):
+        self.add(indicator(), "k1", added_at="2024-01-02T00:00:00Z")
+        self.add(identity(), "k2", added_at="2024-01-03T00:00:00Z")
+        self.add(malware(), "k3", added_at="2024-01-04T00:00:00Z")
+        first = self.service.list_objects(
+            "feed", None, ["2024-01-02T00:00:00Z"], ["1"]
+        ).to_json()
+        pages = self.walk(first)
+        seen = [item["id"] for page in pages for item in page["objects"]]
+        self.assertEqual([IDENTITY_ID, MALWARE_ID], seen)
+
+    def test_snapshot_excludes_objects_added_mid_round(self):
+        self.add(identity(), "k1", added_at="2024-01-02T00:00:00Z")
+        self.add(indicator(), "k2", added_at="2024-01-03T00:00:00Z")
+        first = self.service.list_objects("feed", limit=["1"]).to_json()
+        self.add(malware(), "k3", added_at="2024-01-04T00:00:00Z")
+        rest = self.walk(first)
+        seen = [item["id"] for page in rest for item in page["objects"]]
+        self.assertEqual([IDENTITY_ID, INDICATOR_ID], seen)
+        fresh = self.walk(self.service.list_objects("feed", limit=["1"]).to_json())
+        self.assertEqual(
+            [IDENTITY_ID, INDICATOR_ID, MALWARE_ID],
+            [item["id"] for page in fresh for item in page["objects"]],
+        )
+
+    def test_snapshot_excludes_revisions_added_mid_round(self):
+        self.add(indicator(), "k1", added_at="2024-01-02T00:00:00Z")
+        self.add(identity(), "k2", added_at="2024-01-03T00:00:00Z")
+        first = self.service.list_objects("feed", limit=["1"]).to_json()
+        self.add(
+            identity(modified="2024-02-01T00:00:00Z", name="Renamed Org"),
+            "k3",
+            added_at="2024-01-04T00:00:00Z",
+        )
+        second = self.service.list_objects("feed", cursor=[first["next"]]).to_json()
+        self.assertEqual([IDENTITY_ID], [item["id"] for item in second["objects"]])
+        self.assertEqual("Example Org", second["objects"][0]["name"])
+        self.assertFalse(second["more"])
+        fresh = self.service.list_objects("feed", limit=["5"]).to_json()
+        renamed = [item for item in fresh["objects"] if item["id"] == IDENTITY_ID]
+        self.assertEqual("Renamed Org", renamed[0]["name"])
+
+    def test_replaying_a_cursor_reads_the_same_page(self):
+        self.add_three()
+        first = self.service.list_objects("feed", limit=["1"]).to_json()
+        replayed = self.service.list_objects("feed", cursor=[first["next"]]).to_json()
+        again = self.service.list_objects("feed", cursor=[first["next"]]).to_json()
+        self.assertEqual(replayed, again)
+        self.assertEqual([INDICATOR_ID], [item["id"] for item in replayed["objects"]])
+
+    def test_limit_must_be_a_decimal_integer_between_1_and_200(self):
+        self.add(identity(), "k1")
+        for raw in (["0"], ["201"], ["-1"], ["1.5"], ["abc"], [""], ["1", "2"]):
+            with self.assertRaisesRegex(ValidationError, "limit"):
+                self.service.list_objects("feed", limit=raw)
+        for raw in (["1"], ["200"]):
+            self.assertEqual(200, self.service.list_objects("feed", limit=raw).status)
+
+    def test_next_rejects_garbage_tampering_and_wrong_collection(self):
+        self.add_three()
+        first = self.service.list_objects("feed", limit=["1"]).to_json()
+        token = first["next"]
+        with self.assertRaisesRegex(ValidationError, "next"):
+            self.service.list_objects("feed", cursor=["not-a-cursor"])
+        with self.assertRaisesRegex(ValidationError, "next"):
+            self.service.list_objects("feed", cursor=[token, token])
+        body, signature = token.split(".")[1:]
+        flipped = body[:-1] + ("A" if body[-1] != "A" else "B")
+        with self.assertRaisesRegex(ValidationError, "next"):
+            self.service.list_objects("feed", cursor=[f"v1.{flipped}.{signature}"])
+        self.service.create_collection({"id": "other", "title": "Other"}, "c9")
+        with self.assertRaisesRegex(ValidationError, "next"):
+            self.service.list_objects("other", cursor=[token])
+
+    def test_next_cannot_be_combined_with_filters_or_limit(self):
+        self.add(identity(), "k1")
+        self.add(indicator(), "k2", added_at="2024-01-03T00:00:00Z")
+        first = self.service.list_objects("feed", limit=["1"]).to_json()
+        token = first["next"]
+        for extra in (
+            {"type_filter": ["identity"]},
+            {"added_after": ["2024-01-01T00:00:00Z"]},
+            {"limit": ["1"]},
+        ):
+            with self.assertRaisesRegex(ValidationError, "next"):
+                self.service.list_objects("feed", cursor=[token], **extra)
+
+    def test_cursor_survives_a_restart(self):
+        path = str(Path(self.directory.name) / "cursor.db")
+        first_service = StixRelay(path)
+        first_service.create_collection({"id": "feed", "title": "Primary feed"}, "c1")
+        first_service.add_object("feed", dict(identity(), added_at="2024-01-02T00:00:00Z"), "k1")
+        first_service.add_object("feed", dict(indicator(), added_at="2024-01-03T00:00:00Z"), "k2")
+        first = first_service.list_objects("feed", limit=["1"]).to_json()
+        reopened = StixRelay(path)
+        second = reopened.list_objects("feed", cursor=[first["next"]]).to_json()
+        self.assertEqual([INDICATOR_ID], [item["id"] for item in second["objects"]])
+
+    def test_unpaged_listing_stays_unpaginated(self):
+        self.add_three()
+        listed = self.service.list_objects("feed").to_json()
+        self.assertEqual(3, len(listed["objects"]))
+        self.assertFalse(listed["more"])
+        self.assertNotIn("next", listed)
+
 
 if __name__ == "__main__":
     unittest.main()

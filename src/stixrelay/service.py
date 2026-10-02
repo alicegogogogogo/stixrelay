@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .cursor import decode_cursor, encode_cursor
 from .errors import ConflictError, NotFoundError, ValidationError
 from .model import (
     MEDIA_TYPE,
@@ -16,6 +18,10 @@ from .model import (
 from .store import Store
 
 COLLECTION_PROPERTIES = ("id", "title", "description", "can_read", "can_write")
+
+# `limit` is a decimal integer between 1 and 200; anything else is rejected.
+LIMIT_VALUE = re.compile(r"[0-9]+")
+MAX_LIMIT = 200
 
 
 @dataclass(frozen=True)
@@ -90,6 +96,26 @@ class StixRelay:
             raise ValidationError("added_after must be supplied exactly once")
         value = raw[0].replace(" ", "T", 1) if " " in raw[0] else raw[0]
         return canonical_timestamp(value, "added_after")
+
+    def _limit(self, raw: Any) -> int | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], str):
+            raise ValidationError("limit must be supplied exactly once")
+        if LIMIT_VALUE.fullmatch(raw[0]) is None:
+            raise ValidationError("limit must be a decimal integer between 1 and 200")
+        limit = int(raw[0])
+        if not 1 <= limit <= MAX_LIMIT:
+            raise ValidationError("limit must be a decimal integer between 1 and 200")
+        return limit
+
+    def _cursor_state(self, raw: Any, collection_id: str) -> dict[str, Any]:
+        if not isinstance(raw, list) or len(raw) != 1:
+            raise ValidationError("next must be supplied exactly once")
+        state = decode_cursor(raw[0], self.store.cursor_secret)
+        if state["c"] != collection_id:
+            raise ValidationError("next does not belong to this collection")
+        return state
 
     def _require_collection(self, collection_id: str) -> dict[str, Any]:
         row = self.store.connection.execute(
@@ -218,12 +244,94 @@ class StixRelay:
         return self._idempotent(key, f"add-object:{collection_id}:{stix_object.id}", create)
 
     def list_objects(
-        self, collection_id: str, type_filter: Any = None, added_after: Any = None
+        self,
+        collection_id: str,
+        type_filter: Any = None,
+        added_after: Any = None,
+        limit: Any = None,
+        cursor: Any = None,
     ) -> Result:
         self._require_collection(collection_id)
+        if cursor is not None and (
+            type_filter is not None or added_after is not None or limit is not None
+        ):
+            raise ValidationError(
+                "next must not be combined with type, added_after, or limit"
+            )
         requested = self._identity(type_filter) if type_filter is not None else None
         cutoff = self._added_after(added_after)
+        page_size = self._limit(limit)
 
+        if page_size is None and cursor is None:
+            return self._list_all(collection_id, requested, cutoff)
+
+        position: tuple[str, str] | None = None
+        if cursor is not None:
+            # A continuation reuses the filters, page size, and snapshot boundary
+            # remembered in the cursor instead of taking them from the query string.
+            state = self._cursor_state(cursor, collection_id)
+            requested = tuple(state["t"]) if state["t"] is not None else None
+            cutoff = state["a"]
+            page_size = state["l"]
+            snapshot = state["s"]
+            position = (state["p"][0], state["p"][1])
+        else:
+            # The snapshot boundary is the highest insertion sequence visible right now:
+            # objects and revisions stored after this point never join this round.
+            snapshot = self.store.connection.execute(
+                "SELECT COALESCE(MAX(rowid), 0) AS seq FROM objects WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()["seq"]
+
+        sql = (
+            "SELECT document, added_at, object_id FROM ("
+            "  SELECT object_id, document, added_at, type,"
+            "         ROW_NUMBER() OVER (PARTITION BY object_id ORDER BY version DESC) AS rank"
+            "  FROM objects WHERE collection_id = ? AND rowid <= ?"
+            ") WHERE rank = 1"
+        )
+        parameters: list[Any] = [collection_id, snapshot]
+        if requested is not None:
+            placeholders = ", ".join("?" for _ in requested)
+            sql += f" AND type IN ({placeholders})"
+            parameters.extend(requested)
+        if cutoff is not None:
+            sql += " AND added_at > ?"
+            parameters.append(cutoff)
+        if position is not None:
+            sql += " AND (added_at > ? OR (added_at = ? AND object_id > ?))"
+            parameters.extend((position[0], position[0], position[1]))
+        sql += " ORDER BY added_at, object_id LIMIT ?"
+        parameters.append(page_size + 1)
+        rows = self.store.connection.execute(sql, parameters).fetchall()
+
+        page = rows[:page_size]
+        more = len(rows) > page_size
+        payload: dict[str, Any] = {
+            "objects": [self.store.decode(row["document"]) for row in page],
+            "more": more,
+        }
+        if more:
+            last = page[-1]
+            payload["next"] = encode_cursor(
+                {
+                    "v": 1,
+                    "c": collection_id,
+                    "t": list(requested) if requested is not None else None,
+                    "a": cutoff,
+                    "l": page_size,
+                    "s": snapshot,
+                    "p": [last["added_at"], last["object_id"]],
+                },
+                self.store.cursor_secret,
+            )
+        if requested is not None:
+            payload["type"] = list(requested)
+        return Result(payload, 200)
+
+    def _list_all(
+        self, collection_id: str, requested: tuple[str, ...] | None, cutoff: str | None
+    ) -> Result:
         sql = (
             "SELECT document, added_at FROM ("
             "  SELECT document, added_at, type,"

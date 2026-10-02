@@ -207,7 +207,35 @@ Both query parameters are optional and may appear at most once.
 {"objects":[{"type":"identity","id":"identity--...","...":"..."}],"more":false,"type":["identity"]}
 ```
 
-`more` is always `false`: this release never paginates.
+Without `limit` the listing is never paginated: `more` is always `false` and no
+`next` is returned.
+
+### Paginate objects
+
+```http
+GET /taxii2/collections/feed/objects/?type=indicator&limit=100
+GET /taxii2/collections/feed/objects/?next=v1.eyJjIjoiZmVlZCIs..._signature
+```
+
+`limit` is a decimal integer between 1 and 200 and starts a paginated round over
+the same filtered, ordered listing described above. While more objects remain,
+the response carries `more: true` and an opaque, URL-safe `next` cursor;
+otherwise `more` is `false` and no `next` is returned. A continuation request
+passes only `next`: the cursor remembers the collection, the `type` and
+`added_after` filters, and the page size of the first request, so repeating any
+of those parameters alongside `next` is a `validation_error`.
+
+A paginated round reads a snapshot taken at the first request: objects and new
+revisions stored afterwards never join the round, and replaying a cursor
+re-reads the same remaining page of that round. Starting over with a fresh
+`limit` request sees the current data. Within a round each object appears
+exactly once, as the newest revision visible in the snapshot, ordered by
+`added_at` and then object id.
+
+A `limit` that is not a decimal integer between 1 and 200, or that appears more
+than once, is a `validation_error`; so is a `next` that is repeated, malformed,
+tampered with, issued for another collection, or combined with `type`,
+`added_after`, or `limit`.
 
 ### Read object versions
 
@@ -238,8 +266,8 @@ Errors use this shape:
 ```
 
 Validation errors (unknown fields, unknown types, bad identifiers, bad patterns,
-missing relationship endpoints, bad `added_after`, unsupported query parameters)
-return 400. Missing collections and objects return 404. Version conflicts,
+missing relationship endpoints, bad `added_after`, bad `limit` or `next`,
+unsupported query parameters) return 400. Missing collections and objects return 404. Version conflicts,
 duplicate collections, and idempotency key reuse return 409.
 
 ## Tests

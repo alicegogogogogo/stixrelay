@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -38,8 +39,25 @@ class Store:
               response TEXT NOT NULL,
               status INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS meta (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
             """
         )
+        # The cursor signing secret is generated once per database and kept here so
+        # that cursors issued before a restart stay valid afterwards.
+        row = self.connection.execute(
+            "SELECT value FROM meta WHERE key = 'cursor_secret'"
+        ).fetchone()
+        if row is None:
+            self.cursor_secret = secrets.token_bytes(32)
+            self.connection.execute(
+                "INSERT INTO meta(key, value) VALUES ('cursor_secret', ?)",
+                (self.cursor_secret.hex(),),
+            )
+        else:
+            self.cursor_secret = bytes.fromhex(row["value"])
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

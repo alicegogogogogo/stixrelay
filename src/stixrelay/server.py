@@ -40,7 +40,7 @@ class Handler(BaseHTTPRequestHandler):
         split = urlsplit(self.path)
         parts = [unquote(part) for part in split.path.split("/") if part]
         query = parse_qs(split.query, keep_blank_values=True)
-        extra = sorted(set(query) - {"type", "added_after"})
+        extra = sorted(set(query) - {"type", "added_after", "limit", "next"})
         if extra:
             raise ValidationError(f"unsupported query parameters: {', '.join(extra)}")
 
@@ -61,7 +61,11 @@ class Handler(BaseHTTPRequestHandler):
             collection_id = parts[2]
             if self.command == "GET":
                 result = self.service.list_objects(
-                    collection_id, query.get("type"), query.get("added_after")
+                    collection_id,
+                    query.get("type"),
+                    query.get("added_after"),
+                    query.get("limit"),
+                    query.get("next"),
                 )
                 return result.status, result.to_json()
             if self.command == "POST":
