@@ -13,6 +13,11 @@ class NotFoundError(StixRelayError):
     status = 404
 
 
+class ForbiddenError(StixRelayError):
+    code = "forbidden"
+    status = 403
+
+
 class ConflictError(StixRelayError):
     code = "conflict"
     status = 409

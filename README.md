@@ -39,6 +39,14 @@ bound the port.
 A collection contains exactly `id`, `title`, `description`, `can_read`, and
 `can_write`; the stored document adds the fixed `media_type` of this release.
 `description` defaults to `""`, and `can_read`/`can_write` default to `true`.
+The flags are enforced on the server: a collection with `can_read: false` is
+invisible — it is absent from the collection list, and every direct read or
+write against it (collection, objects, versions) fails with the same
+`not_found` as a collection that does not exist, so its existence is never
+revealed. A readable collection with `can_write: false` rejects object POSTs
+with `forbidden`. Access is checked before validation, idempotency, versioning,
+and cursor handling, so a denied request stores nothing and does not consume
+its idempotency key.
 
 ```json
 {
@@ -145,8 +153,10 @@ GET /taxii2/collections
 GET /taxii2/collections/feed
 ```
 
-The first returns `{"collections":[...]}` sorted by `id`; the second returns one
-collection. An unknown collection is `not_found`.
+The first returns `{"collections":[...]}` sorted by `id`, limited to collections
+with `can_read: true`; the second returns one collection. An unknown or
+unreadable collection is `not_found` with the message
+`collection access is denied`.
 
 ### Add an object
 
@@ -279,9 +289,10 @@ Errors use this shape:
 
 Validation errors (unknown fields, unknown types, bad identifiers, bad patterns,
 missing relationship endpoints, bad `added_after`, bad `limit` or `next`,
-unsupported query parameters) return 400. Missing collections and objects return
-404. Version conflicts, duplicate collections, and idempotency key reuse return
-409.
+unsupported query parameters) return 400. Writes to a read-only collection
+return 403 (`forbidden`). Missing collections and objects — and any access to a
+collection with `can_read: false` — return 404. Version conflicts, duplicate
+collections, and idempotency key reuse return 409.
 
 ## Tests
 

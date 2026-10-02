@@ -146,6 +146,70 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual([MALWARE_ID], [item["id"] for item in body["objects"]])
 
+    def test_collection_access_boundary(self):
+        self.request(
+            "POST",
+            "/taxii2/collections",
+            {"id": "hidden", "title": "Hidden", "can_read": False},
+            "ha1",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections",
+            {"id": "readonly", "title": "Read only", "can_write": False},
+            "ha2",
+        )
+
+        status, body = self.request("GET", "/taxii2/collections")
+        self.assertEqual(200, status)
+        self.assertNotIn("hidden", [item["id"] for item in body["collections"]])
+        self.assertIn("readonly", [item["id"] for item in body["collections"]])
+
+        for path in (
+            "/taxii2/collections/hidden",
+            "/taxii2/collections/hidden/objects/",
+            f"/taxii2/collections/hidden/objects/{IDENTITY_ID}/versions/",
+        ):
+            status, body = self.request("GET", path)
+            self.assertEqual(404, status, path)
+            self.assertEqual(
+                {"error": {"code": "not_found", "message": "collection access is denied"}},
+                body,
+                path,
+            )
+
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/hidden/objects/",
+            dict(identity(), added_at=IDENTITY_ADDED_AT),
+            "ha3",
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("collection access is denied", body["error"]["message"])
+
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/readonly/objects/",
+            dict(identity(), added_at=IDENTITY_ADDED_AT),
+            "ha4",
+        )
+        self.assertEqual(403, status)
+        self.assertEqual(
+            {"error": {"code": "forbidden", "message": "collection is not writable"}}, body
+        )
+
+        # The denied write consumed nothing: the same key works on a writable collection.
+        self.request(
+            "POST", "/taxii2/collections", {"id": "writable", "title": "Writable"}, "ha5"
+        )
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/writable/objects/",
+            dict(identity(), added_at=IDENTITY_ADDED_AT),
+            "ha4",
+        )
+        self.assertEqual(201, status)
+
     def test_content_type_must_be_json(self):
         request = urllib.request.Request(
             self.base + "/taxii2/collections", data=b"{}", method="POST"

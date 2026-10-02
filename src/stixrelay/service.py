@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import cursor
-from .errors import ConflictError, NotFoundError, ValidationError
+from .errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from .model import (
     MEDIA_TYPE,
     OBJECT_TYPES,
@@ -106,13 +106,24 @@ class StixRelay:
             raise ValidationError("limit must be a decimal integer between 1 and 200")
         return page_size
 
-    def _require_collection(self, collection_id: str) -> dict[str, Any]:
+    def _collection_document(self, collection_id: str) -> dict[str, Any] | None:
         row = self.store.connection.execute(
             "SELECT document FROM collections WHERE id = ?", (collection_id,)
         ).fetchone()
-        if not row:
-            raise NotFoundError(f"collection {collection_id} was not found")
-        return self.store.decode(row["document"])
+        return self.store.decode(row["document"]) if row else None
+
+    def _require_readable(self, collection_id: str) -> dict[str, Any]:
+        """Missing and unreadable collections are indistinguishable: both 404."""
+        document = self._collection_document(collection_id)
+        if document is None or not document.get("can_read", True):
+            raise NotFoundError("collection access is denied")
+        return document
+
+    def _require_writable(self, collection_id: str) -> dict[str, Any]:
+        document = self._require_readable(collection_id)
+        if not document.get("can_write", True):
+            raise ForbiddenError("collection is not writable")
+        return document
 
     def _require_references(self, collection_id: str, stix_object: StixObject) -> None:
         """Every relationship endpoint must already exist in the same collection."""
@@ -172,17 +183,24 @@ class StixRelay:
         return self._idempotent(key, f"create-collection:{collection_id}", create)
 
     def get_collection(self, collection_id: str) -> dict[str, Any]:
-        return self._require_collection(collection_id)
+        return self._require_readable(collection_id)
 
     def list_collections(self) -> list[dict[str, Any]]:
         rows = self.store.connection.execute(
             "SELECT document FROM collections ORDER BY id"
         ).fetchall()
-        return [self.store.decode(row["document"]) for row in rows]
+        return [
+            document
+            for document in (self.store.decode(row["document"]) for row in rows)
+            if document.get("can_read", True)
+        ]
 
     def add_object(
         self, collection_id: str, raw: Any, key: str | None, added_at: str | None = None
     ) -> Result:
+        # Access is decided before any validation, idempotency, or versioning work
+        # so a denied request consumes nothing and reveals nothing.
+        self._require_writable(collection_id)
         if not isinstance(raw, dict):
             raise ValidationError("object body must be a JSON object")
         if "added_at" in raw:
@@ -199,7 +217,6 @@ class StixRelay:
         )
 
         def create() -> Result:
-            self._require_collection(collection_id)
             self._require_references(collection_id, stix_object)
             row = self.store.connection.execute(
                 "SELECT version FROM objects WHERE collection_id = ? AND object_id = ?"
@@ -241,7 +258,7 @@ class StixRelay:
         limit: Any = None,
         next_token: Any = None,
     ) -> Result:
-        self._require_collection(collection_id)
+        self._require_readable(collection_id)
         token = self._next_token(next_token)
         if token is not None:
             if type_filter is not None or added_after is not None or limit is not None:
@@ -379,7 +396,7 @@ class StixRelay:
         return Result(payload, 200)
 
     def object_versions(self, collection_id: str, object_id: str) -> Result:
-        self._require_collection(collection_id)
+        self._require_readable(collection_id)
         if not isinstance(object_id, str) or not object_id:
             raise ValidationError("objectId must be a non-empty STIX identifier")
         rows = self.store.connection.execute(

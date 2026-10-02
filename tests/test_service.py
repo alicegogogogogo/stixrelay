@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from stixrelay.errors import ConflictError, NotFoundError, ValidationError
+from stixrelay.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from stixrelay.service import StixRelay
 
 IDENTITY_ID = "identity--f431f809-377b-45e0-aa1c-6a4751cae5ff"
@@ -279,10 +279,75 @@ class StixRelayTests(unittest.TestCase):
         self.assertEqual([IDENTITY_ID, INDICATOR_ID, MALWARE_ID], [item["id"] for item in first])
 
     def test_unknown_collection_is_not_found(self):
-        with self.assertRaisesRegex(NotFoundError, "was not found"):
+        with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
             self.service.list_objects("missing")
-        with self.assertRaisesRegex(NotFoundError, "was not found"):
+        with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
             self.service.add_object("missing", identity(), "k1")
+
+    # ------------------------------------------------------------------ access
+
+    def _restricted_collection(self, **flags):
+        self.service.create_collection(
+            {"id": "restricted", "title": "Restricted", **flags}, "cr"
+        )
+
+    def test_listing_hides_unreadable_collections(self):
+        self._restricted_collection(can_read=False)
+        self.service.create_collection({"id": "alpha", "title": "Alpha"}, "ca")
+        listed = self.service.list_collections()
+        self.assertEqual(["alpha", "feed"], [item["id"] for item in listed])
+
+    def test_unreadable_collection_is_indistinguishable_from_missing(self):
+        self._restricted_collection(can_read=False)
+        for call in (
+            lambda: self.service.get_collection("restricted"),
+            lambda: self.service.list_objects("restricted"),
+            lambda: self.service.object_versions("restricted", IDENTITY_ID),
+            lambda: self.service.add_object("restricted", identity(), "k1"),
+        ):
+            with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
+                call()
+
+    def test_read_only_collection_rejects_writes_with_forbidden(self):
+        self._restricted_collection(can_write=False)
+        self.assertEqual("Restricted", self.service.get_collection("restricted")["title"])
+        with self.assertRaisesRegex(ForbiddenError, "collection is not writable"):
+            self.service.add_object("restricted", identity(), "k1")
+
+    def test_denied_writes_do_not_consume_the_idempotency_key(self):
+        self._restricted_collection(can_write=False)
+        with self.assertRaises(ForbiddenError):
+            self.service.add_object("restricted", identity(), "reuse")
+        stored = self.service.add_object(
+            "feed", dict(identity(), added_at="2024-01-02T00:00:00Z"), "reuse"
+        )
+        self.assertEqual(201, stored.status)
+
+    def test_unreadable_collection_does_not_start_or_continue_a_snapshot(self):
+        self._restricted_collection(can_read=True, can_write=True)
+        self.service.add_object(
+            "restricted", dict(identity(), added_at="2024-01-02T00:00:00Z"), "k1"
+        )
+        token = self.service.list_objects("restricted", limit=["1"]).to_json()
+        self.assertFalse(token["more"])
+        self.service.store.connection.execute(
+            "UPDATE collections SET document = ? WHERE id = ?",
+            (
+                self.service.store.encode(
+                    {
+                        "id": "restricted",
+                        "title": "Restricted",
+                        "description": "",
+                        "can_read": False,
+                        "can_write": False,
+                        "media_type": "application/stix+json;version=2.1",
+                    }
+                ),
+                "restricted",
+            ),
+        )
+        with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
+            self.service.list_objects("restricted", limit=["1"])
 
     def test_idempotent_create_returns_the_first_result(self):
         first = self.service.add_object("feed", dict(indicator(), added_at="2024-01-02T00:00:00Z"), "same")
