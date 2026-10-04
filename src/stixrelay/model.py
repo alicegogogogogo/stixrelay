@@ -399,6 +399,11 @@ class StixObject:
             return tuple(self.properties["object_refs"])
         return ()
 
+    @property
+    def revoked(self) -> bool:
+        """Whether this version revokes the object; an omitted flag means false."""
+        return bool(self.properties.get("revoked", False))
+
     def version_key(self) -> str:
         """The TAXII version identifier of this revision."""
         return self.modified

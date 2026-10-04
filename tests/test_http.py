@@ -548,5 +548,86 @@ class HttpTests(unittest.TestCase):
         self.assertFalse(second["more"])
 
 
+    # -------------------------------------------------------------- revocation
+
+    def test_revocation_lifecycle_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "rv", "title": "Revocations"}, "rv0")
+        base = dict(identity(), added_at="2024-01-02T00:00:00Z")
+        status, first = self.request("POST", "/taxii2/collections/rv/objects/", base, "rv1")
+        self.assertEqual(201, status)
+        self.assertNotIn("revoked", first["object"])
+
+        # A revocation that also changes another property is a 400 and writes nothing.
+        bad = dict(
+            identity(modified="2024-02-01T00:00:00Z", name="Changed"),
+            revoked=True,
+            added_at="2024-02-02T00:00:00Z",
+        )
+        status, body = self.request("POST", "/taxii2/collections/rv/objects/", bad, "rv-bad")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+        self.assertIn("name", body["error"]["message"])
+
+        # The rejected key is reusable for the conforming revocation.
+        good = dict(
+            identity(modified="2024-02-01T00:00:00Z"),
+            revoked=True,
+            added_at="2024-02-02T00:00:00Z",
+        )
+        status, body = self.request("POST", "/taxii2/collections/rv/objects/", good, "rv-bad")
+        self.assertEqual(201, status)
+        self.assertIs(body["object"]["revoked"], True)
+        self.assertEqual("2024-02-01T00:00:00.000000Z", body["version"])
+
+        # The revoked object stays visible and is not hidden from listings.
+        status, body = self.request("GET", "/taxii2/collections/rv/objects/")
+        self.assertEqual(200, status)
+        self.assertEqual([IDENTITY_ID], [item["id"] for item in body["objects"]])
+        self.assertIs(body["objects"][0]["revoked"], True)
+
+        status, body = self.request(
+            "GET", f"/taxii2/collections/rv/objects/{IDENTITY_ID}/versions/"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            ["2024-01-01T00:00:00.000000Z", "2024-02-01T00:00:00.000000Z"],
+            body["versions"],
+        )
+        self.assertEqual(["2024-02-01T00:00:00.000000Z"], body["latest"])
+
+        # Any later write is a 409 conflict, including one that un-revokes.
+        for index, payload in enumerate(
+            (
+                dict(identity(modified="2024-03-01T00:00:00Z")),
+                dict(identity(modified="2024-03-01T00:00:00Z"), revoked=False),
+                dict(identity(modified="2024-03-01T00:00:00Z"), revoked=True, name="X"),
+            )
+        ):
+            payload["added_at"] = "2024-03-02T00:00:00Z"
+            status, error_body = self.request(
+                "POST", "/taxii2/collections/rv/objects/", payload, f"rv-after-{index}"
+            )
+            self.assertEqual(409, status)
+            self.assertEqual("conflict", error_body["error"]["code"])
+
+        # Replaying the original successful key still returns the first response.
+        status, replayed = self.request("POST", "/taxii2/collections/rv/objects/", base, "rv1")
+        self.assertEqual(201, status)
+        self.assertEqual(first, replayed)
+
+    def test_a_first_version_may_be_born_revoked_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "rv2", "title": "Imported"}, "rv20")
+        payload = dict(identity(), revoked=True, added_at="2024-01-02T00:00:00Z")
+        status, body = self.request("POST", "/taxii2/collections/rv2/objects/", payload, "rv21")
+        self.assertEqual(201, status)
+        self.assertIs(body["object"]["revoked"], True)
+        follow_up = dict(identity(modified="2024-02-01T00:00:00Z"), added_at="2024-02-02T00:00:00Z")
+        status, body = self.request(
+            "POST", "/taxii2/collections/rv2/objects/", follow_up, "rv22"
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", body["error"]["code"])
+
+
 if __name__ == "__main__":
     unittest.main()

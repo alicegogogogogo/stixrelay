@@ -127,6 +127,39 @@ The `modified` timestamp **is** the TAXII version identifier of a revision.
 - `GET /objects/` and delta listings report the newest revision of each object;
   `GET /objects/{objectId}/versions/` reports every revision.
 
+### Revocation
+
+`revoked` is the object lifecycle flag, not an ordinary editable property.
+
+- the first version may omit `revoked`, set it explicitly to `false`, or set it to
+  `true` when importing intelligence that is already revoked. An omitted flag is
+  treated as `false` by lifecycle checks and is not added to the response;
+- while the current version is not revoked, a normal new version follows the usual
+  validation and monotonicity rules and may change any property;
+- posting a later `modified` with `revoked` changing from `false` (or omitted) to
+  `true` creates a **revocation version**. After normalisation every property and
+  value except `modified` and `revoked` must be identical to the current version;
+  otherwise the response is `400 validation_error` and no version is written;
+- a successful revocation returns the usual `201` write response with
+  `object.revoked` set to `true` and `version` equal to the normalised `modified`;
+- a revocation version becomes the current version: it is never hidden, it appears
+  in unpaginated and paginated object listings, enters strictly half-open
+  `added_after` deltas at its own `added_at`, and is listed in `versions`,
+  `latest`, and `added_at`. Historical versions stay untouched;
+- a pagination snapshot keeps the revocation state it started with: a revocation
+  received after the first paged request never enters that round's later pages;
+- revocation never cascades: relationships and reports keep working, and a
+  revoked object still counts as an existing object of the collection in the
+  relationship and report reference integrity checks;
+- once the current version is revoked, **any** later write to that id in the
+  collection is a `409 conflict` — a later `modified`, flipping `revoked` back to
+  `false`, omitting `revoked`, or changing other properties alike. Writes with the
+  same or an earlier `modified` keep their existing `conflict` semantics.
+
+A rejected revocation or a write rejected after revocation adds no version and
+does not consume its idempotency key. Replaying a key whose first write succeeded
+still returns that first response, even when the object has since been revoked.
+
 ### `added_at`
 
 `added_at` is when the server received a version, with microsecond precision. It is
@@ -305,11 +338,13 @@ Errors use this shape:
 ```
 
 Validation errors (unknown fields, unknown types, bad identifiers, bad patterns,
-missing relationship endpoints, unresolvable report `object_refs`, bad
+missing relationship endpoints, unresolvable report `object_refs`, a revocation
+version that changes anything besides `modified` and `revoked`, bad
 `added_after`, bad `limit` or `next`, unsupported query parameters) return 400. Writes to a read-only collection
 return 403 (`forbidden`). Missing collections and objects — and any access to a
 collection with `can_read: false` — return 404. Version conflicts, duplicate
-collections, and idempotency key reuse return 409.
+collections, writes to an already revoked object, and idempotency key reuse
+return 409.
 
 ## Tests
 

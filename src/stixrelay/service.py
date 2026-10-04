@@ -42,6 +42,21 @@ def _object_result(document: dict[str, Any], collection_id: str, added_at: str, 
     return Result(payload, status)
 
 
+# The lifecycle fields are the only ones a revocation version is allowed to change.
+_REVOCATION_LIFETIME_FIELDS = ("modified", "revoked")
+
+
+def _revocation_mismatch(current: dict[str, Any], replacement: dict[str, Any]) -> list[str]:
+    """Properties a revocation version adds, drops, or changes besides the lifecycle fields."""
+    mismatched: list[str] = []
+    for key in sorted(set(current) | set(replacement)):
+        if key in _REVOCATION_LIFETIME_FIELDS:
+            continue
+        if key not in current or key not in replacement or current[key] != replacement[key]:
+            mismatched.append(key)
+    return mismatched
+
+
 class StixRelay:
     """STIX 2.1 object library with a TAXII 2.1 collection subset."""
 
@@ -217,12 +232,12 @@ class StixRelay:
         )
 
         def create() -> Result:
-            self._require_references(collection_id, stix_object)
             row = self.store.connection.execute(
-                "SELECT version FROM objects WHERE collection_id = ? AND object_id = ?"
+                "SELECT version, document FROM objects WHERE collection_id = ? AND object_id = ?"
                 " ORDER BY version DESC LIMIT 1",
                 (collection_id, stix_object.id),
             ).fetchone()
+            current_document: dict[str, Any] | None = None
             if row:
                 if row["version"] == stix_object.modified:
                     raise ConflictError(
@@ -232,6 +247,21 @@ class StixRelay:
                     raise ConflictError(
                         f"version {stix_object.modified} of {stix_object.id} is older than the"
                         f" stored version {row['version']}"
+                    )
+                current_document = self.store.decode(row["document"])
+                if current_document.get("revoked", False):
+                    # A revoked object is terminal in its collection: any later write
+                    # is a conflict, even one that flips revoked back or matches exactly.
+                    raise ConflictError(
+                        f"{stix_object.id} is revoked and accepts no further versions"
+                    )
+            self._require_references(collection_id, stix_object)
+            if current_document is not None and stix_object.revoked:
+                mismatched = _revocation_mismatch(current_document, stix_object.document())
+                if mismatched:
+                    raise ValidationError(
+                        "a revocation version must keep every property and value of the current"
+                        " version except modified and revoked; changed: " + ", ".join(mismatched)
                     )
             self.store.connection.execute(
                 "INSERT INTO objects(collection_id, object_id, version, type, added_at, document)"
