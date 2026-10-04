@@ -139,6 +139,21 @@ class StixRelay:
                     f" {reference} in collection {collection_id}"
                 )
 
+    @staticmethod
+    def _require_revocation_match(current: dict[str, Any], stix_object: StixObject) -> None:
+        """A revocation version may only differ in `modified` and `revoked`."""
+        candidate = stix_object.document()
+        changed = sorted(
+            name
+            for name in set(current) | set(candidate)
+            if name not in ("modified", "revoked") and current.get(name) != candidate.get(name)
+        )
+        if changed:
+            raise ValidationError(
+                f"revocation of {stix_object.id} must not change properties other than"
+                f" modified and revoked; differing: {', '.join(changed)}"
+            )
+
     # ------------------------------------------------------------------- public
 
     def create_collection(self, raw: Any, key: str | None) -> Result:
@@ -219,7 +234,7 @@ class StixRelay:
         def create() -> Result:
             self._require_references(collection_id, stix_object)
             row = self.store.connection.execute(
-                "SELECT version FROM objects WHERE collection_id = ? AND object_id = ?"
+                "SELECT version, document FROM objects WHERE collection_id = ? AND object_id = ?"
                 " ORDER BY version DESC LIMIT 1",
                 (collection_id, stix_object.id),
             ).fetchone()
@@ -233,6 +248,15 @@ class StixRelay:
                         f"version {stix_object.modified} of {stix_object.id} is older than the"
                         f" stored version {row['version']}"
                     )
+                current = self.store.decode(row["document"])
+                # An omitted revoked counts as false; once the current version is
+                # revoked the object is closed to every further write.
+                if current.get("revoked", False):
+                    raise ConflictError(
+                        f"{stix_object.id} is revoked and no longer accepts new versions"
+                    )
+                if stix_object.properties.get("revoked", False):
+                    self._require_revocation_match(current, stix_object)
             self.store.connection.execute(
                 "INSERT INTO objects(collection_id, object_id, version, type, added_at, document)"
                 " VALUES (?, ?, ?, ?, ?, ?)",

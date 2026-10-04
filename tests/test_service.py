@@ -793,6 +793,159 @@ class StixRelayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "not a valid cursor"):
             self.service.list_objects("feed", next_token=[None])
 
+    # --------------------------------------------------------------- revocation
+
+    def test_first_version_may_be_revoked_for_historical_imports(self):
+        stored = self.add(dict(indicator(), revoked=True), "k1")
+        self.assertTrue(stored["object"]["revoked"])
+        listed = self.service.list_objects("feed").to_json()["objects"]
+        self.assertEqual([stored["object"]], listed)
+
+    def test_omitted_revoked_is_not_echoed_and_treated_as_false(self):
+        stored = self.add(identity(), "k1")
+        self.assertNotIn("revoked", stored["object"])
+        # A plain newer version still follows the normal rules.
+        followup = self.add(identity(modified="2024-02-01T00:00:00Z", name="Renamed"), "k2")
+        self.assertNotIn("revoked", followup["object"])
+        self.assertEqual("Renamed", followup["object"]["name"])
+
+    def test_revocation_version_is_stored_and_becomes_current(self):
+        self.add(identity(), "k1", added_at="2024-01-02T00:00:00Z")
+        revoked = self.add(
+            dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True),
+            "k2",
+            added_at="2024-02-02T00:00:00Z",
+        )
+        self.assertTrue(revoked["object"]["revoked"])
+        self.assertEqual("2024-02-01T00:00:00.000000Z", revoked["version"])
+        current = self.service.list_objects("feed").to_json()["objects"]
+        self.assertEqual([revoked["object"]], current)
+        versions = self.service.object_versions("feed", IDENTITY_ID).to_json()
+        self.assertEqual(
+            ["2024-01-01T00:00:00.000000Z", "2024-02-01T00:00:00.000000Z"],
+            versions["versions"],
+        )
+        self.assertEqual(["2024-02-01T00:00:00.000000Z"], versions["latest"])
+        self.assertEqual(
+            ["2024-01-02T00:00:00.000000Z", "2024-02-02T00:00:00.000000Z"],
+            versions["added_at"],
+        )
+
+    def test_revoked_version_participates_in_delta_reads(self):
+        self.add(identity(), "k1", added_at="2024-01-02T00:00:00Z")
+        self.add(
+            dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True),
+            "k2",
+            added_at="2024-03-02T00:00:00Z",
+        )
+        objects = self.service.list_objects("feed", None, ["2024-02-01T00:00:00Z"]).to_json()["objects"]
+        self.assertEqual(1, len(objects))
+        self.assertTrue(objects[0]["revoked"])
+
+    def test_revocation_must_not_change_other_properties(self):
+        self.add(identity(), "k1")
+        for index, overrides in enumerate(
+            (
+                dict(name="Renamed Org"),
+                dict(identity_class="individual"),
+                dict(labels=["new"]),
+                dict(created="2024-01-02T00:00:00Z"),
+            )
+        ):
+            with self.assertRaisesRegex(ValidationError, "must not change properties"):
+                self.add(
+                    dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True, **overrides),
+                    f"rev-bad-{index}",
+                )
+        versions = self.service.object_versions("feed", IDENTITY_ID).to_json()
+        self.assertEqual(["2024-01-01T00:00:00.000000Z"], versions["versions"])
+
+    def test_revocation_cannot_drop_properties(self):
+        self.add(dict(identity(), description="old"), "k1")
+        with self.assertRaisesRegex(ValidationError, "must not change properties"):
+            self.add(dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True), "k2")
+
+    def test_revoked_object_rejects_every_later_write(self):
+        self.add(identity(), "k1")
+        self.add(dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True), "k2")
+        attempts = (
+            dict(identity(modified="2024-03-01T00:00:00Z")),
+            dict(identity(modified="2024-03-01T00:00:00Z"), revoked=False),
+            dict(identity(modified="2024-03-01T00:00:00Z"), revoked=True),
+            dict(identity(modified="2024-03-01T00:00:00Z", name="Renamed"), revoked=True),
+        )
+        for index, payload in enumerate(attempts):
+            with self.assertRaisesRegex(ConflictError, "revoked"):
+                self.add(payload, f"post-rev-{index}")
+        versions = self.service.object_versions("feed", IDENTITY_ID).to_json()
+        self.assertEqual(2, len(versions["versions"]))
+        self.assertEqual(1, len(self.service.list_objects("feed").to_json()["objects"]))
+        # The rejected writes did not consume their idempotency keys.
+        self.service.create_collection({"id": "other", "title": "Other"}, "co")
+        reused = self.service.add_object(
+            "other",
+            dict(identity(), added_at="2024-01-02T00:00:00Z"),
+            "post-rev-0",
+        )
+        self.assertEqual(201, reused.status)
+
+    def test_revoked_object_keeps_existing_conflict_semantics_for_old_versions(self):
+        self.add(identity(), "k1")
+        self.add(dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True), "k2")
+        with self.assertRaisesRegex(ConflictError, "already exists"):
+            self.add(dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True), "k3")
+        with self.assertRaisesRegex(ConflictError, "older than the stored version"):
+            self.add(identity(), "k4")
+
+    def test_idempotent_replay_is_unaffected_by_a_later_revocation(self):
+        first = self.add(identity(), "k1", added_at="2024-01-02T00:00:00Z")
+        self.add(
+            dict(identity(modified="2024-02-01T00:00:00Z"), revoked=True),
+            "k2",
+            added_at="2024-02-02T00:00:00Z",
+        )
+        replayed = self.add(identity(), "k1", added_at="2024-01-02T00:00:00Z")
+        self.assertEqual(first, replayed)
+        self.assertNotIn("revoked", replayed["object"])
+
+    def test_revoked_object_still_satisfies_reference_integrity(self):
+        self.add(indicator(), "k1")
+        self.add(identity(), "k2")
+        self.add(
+            dict(indicator(modified="2024-02-01T00:00:00Z"), revoked=True),
+            "k3",
+            added_at="2024-02-02T00:00:00Z",
+        )
+        # Relationships and reports referencing the revoked object are unaffected.
+        stored = self.add(relationship(), "k4", added_at="2024-02-03T00:00:00Z")
+        self.assertEqual(RELATIONSHIP_ID, stored["object"]["id"])
+        report_stored = self.add(report(), "k5", added_at="2024-02-04T00:00:00Z")
+        self.assertEqual(REPORT_ID, report_stored["object"]["id"])
+        listed = self.service.list_objects("feed").to_json()["objects"]
+        self.assertEqual(4, len(listed))
+
+    def test_revocation_after_snapshot_start_stays_out_of_that_snapshot(self):
+        self._seed_indicators(2)
+        first = self.service.list_objects("feed", limit=["1"]).to_json()
+        self.add(
+            dict(self._paged_indicator(1, modified="2024-05-01T00:00:00Z"), revoked=True),
+            "ind-1-revoked",
+            added_at="2024-05-02T00:00:00Z",
+        )
+        second = self.service.list_objects("feed", next_token=[first["next"]]).to_json()
+        self.assertEqual(1, len(second["objects"]))
+        self.assertNotIn("revoked", second["objects"][0])
+        fresh = self.service.list_objects("feed").to_json()["objects"]
+        revoked = [item for item in fresh if item["id"] == self.PAGE_INDICATOR_IDS[0]]
+        self.assertTrue(revoked[0]["revoked"])
+
+    def test_revocation_checks_run_after_collection_permissions(self):
+        self._restricted_collection(can_write=False)
+        with self.assertRaisesRegex(ForbiddenError, "collection is not writable"):
+            self.service.add_object(
+                "restricted", dict(identity(), revoked=True), "k1"
+            )
+
     def test_cursor_signed_by_another_service_is_rejected(self):
         self._seed_indicators(2)
         other = StixRelay(str(Path(self.directory.name) / "other-secret.db"))
