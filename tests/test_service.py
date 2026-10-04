@@ -11,6 +11,8 @@ MALWARE_ID = "malware--3c9d1e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
 RELATIONSHIP_ID = "relationship--b6a1e2c3-1f2a-4b3c-8d4e-5f6a7b8c9d0e"
 REPORT_ID = "report--c7d8e9f0-1a2b-4c3d-8e4f-5a6b7c8d9e0f"
 REPORT2_ID = "report--d8e9f012-3b4c-4d5e-9f50-6a7b8c9d0e1f"
+NOTE_ID = "note--e9f01234-4c5d-4e6f-8a01-7b8c9d0e1f2a"
+NOTE2_ID = "note--f0123456-5d6e-4f70-9b12-8c9d0e1f2a3b"
 
 CREATED = "2024-01-01T00:00:00Z"
 REPORT_PUBLISHED = "2024-03-01T00:00:00Z"
@@ -93,6 +95,25 @@ def revoked(payload: dict) -> dict:
     body = dict(payload)
     body["revoked"] = True
     return body
+
+
+def note(
+    *,
+    modified: str = CREATED,
+    object_refs: list[str] | None = None,
+    note_id: str = NOTE_ID,
+) -> dict:
+    return {
+        "type": "note",
+        "spec_version": "2.1",
+        "id": note_id,
+        "created": CREATED,
+        "modified": modified,
+        "abstract": "Short summary",
+        "content": "An analyst looked at this indicator",
+        "authors": ["analyst-one"],
+        "object_refs": [INDICATOR_ID] if object_refs is None else object_refs,
+    }
 
 
 class StixRelayTests(unittest.TestCase):
@@ -784,6 +805,215 @@ class StixRelayTests(unittest.TestCase):
             "feed", dict(indicator(), added_at="2024-01-02T00:00:00Z"), "k1"
         )
         self.assertEqual(201, stored.status)
+
+    # ------------------------------------------------------------------- notes
+
+    def _seed_note_targets(self):
+        self.add(indicator(), "note-ind", added_at="2024-01-02T00:00:00Z")
+        self.add(identity(), "note-ide", added_at="2024-01-03T00:00:00Z")
+
+    def test_note_round_trip_preserves_every_property(self):
+        self._seed_note_targets()
+        stored = self.add(note(), "note-1", added_at="2024-01-04T00:00:00Z")
+        document = stored["object"]
+        self.assertEqual("note", document["type"])
+        self.assertEqual(NOTE_ID, document["id"])
+        self.assertEqual("Short summary", document["abstract"])
+        self.assertEqual("An analyst looked at this indicator", document["content"])
+        self.assertEqual(["analyst-one"], document["authors"])
+        self.assertEqual([INDICATOR_ID], document["object_refs"])
+        self.assertEqual("2024-01-01T00:00:00.000000Z", stored["version"])
+        self.assertEqual("2024-01-04T00:00:00.000000Z", stored["added_at"])
+        listed = self.service.list_objects("feed", ["note"]).to_json()
+        self.assertEqual([document], listed["objects"])
+        self.assertEqual(["note"], listed["type"])
+
+    def test_note_optional_properties_are_absent_when_omitted(self):
+        self._seed_note_targets()
+        minimal = {
+            key: value for key, value in note().items() if key not in ("abstract", "authors")
+        }
+        stored = self.add(minimal, "note-min")
+        self.assertNotIn("abstract", stored["object"])
+        self.assertNotIn("authors", stored["object"])
+
+    def test_note_required_properties_are_enforced(self):
+        self._seed_note_targets()
+        for field in ("content", "object_refs"):
+            with self.assertRaisesRegex(ValidationError, f"note requires the {field} property"):
+                self.add(
+                    {key: value for key, value in note().items() if key != field},
+                    f"note-req-{field}",
+                )
+
+    def test_note_property_types_are_enforced(self):
+        self._seed_note_targets()
+        bad = (
+            (dict(content=""), "content must be a non-empty string"),
+            (dict(content=1), "content must be a non-empty string"),
+            (dict(abstract=""), "abstract must be a non-empty string"),
+            (dict(authors=[]), "authors must be a non-empty array"),
+            (dict(authors=[""]), "authors must be a non-empty array"),
+            (dict(authors="analyst-one"), "authors must be a non-empty array"),
+            (dict(whatever=1), "unsupported properties: whatever"),
+        )
+        for index, (overrides, message) in enumerate(bad):
+            with self.assertRaisesRegex(ValidationError, message):
+                self.add(dict(note(), **overrides), f"note-type-{index}")
+
+    def test_note_id_prefix_must_match_type(self):
+        self._seed_note_targets()
+        with self.assertRaisesRegex(ValidationError, "does not match type note"):
+            self.add(note(note_id=INDICATOR_ID), "note-prefix")
+
+    def test_note_object_refs_must_be_non_empty_unique_and_supported(self):
+        self._seed_note_targets()
+        cases = (
+            ([], "non-empty array of STIX identifiers"),
+            (IDENTITY_ID, "non-empty array of STIX identifiers"),
+            ([INDICATOR_ID, INDICATOR_ID], "duplicate reference"),
+            ([1], "must be a STIX identifier"),
+            ([""], "must be a STIX identifier"),
+            (["identity--not-a-uuid"], "must be a STIX identifier"),
+            (["identity--f431f809-377b-15e0-aa1c-6a4751cae5ff"], "must be a STIX identifier"),
+            (["campaign--a1a1a1a1-1a1a-4a1a-8a1a-1a1a1a1a1a1a"], "must reference one of"),
+        )
+        for index, (refs, message) in enumerate(cases):
+            with self.assertRaisesRegex(ValidationError, message):
+                self.add(note(note_id=NOTE2_ID, object_refs=refs), f"note-ref-{index}")
+        self.assertEqual([], self.service.list_objects("feed", ["note"]).to_json()["objects"])
+
+    def test_note_cannot_reference_itself(self):
+        self._seed_note_targets()
+        with self.assertRaisesRegex(ValidationError, "note must not reference itself"):
+            self.add(note(object_refs=[NOTE_ID]), "note-self")
+        # The failed write consumed neither a version nor the idempotency key.
+        with self.assertRaises(NotFoundError):
+            self.service.object_versions("feed", NOTE_ID)
+        self.assertEqual(201, self.add_status(note(), "note-self"))
+
+    def test_note_references_must_already_exist_in_the_collection(self):
+        with self.assertRaisesRegex(ValidationError, "note references unknown indicator"):
+            self.add(note(), "note-unknown")
+        self.assertEqual([], self.service.list_objects("feed", ["note"]).to_json()["objects"])
+        with self.assertRaises(NotFoundError):
+            self.service.object_versions("feed", NOTE_ID)
+
+    def test_note_reference_to_another_collection_is_unknown(self):
+        self._seed_note_targets()
+        self.service.create_collection({"id": "other", "title": "Other feed"}, "co")
+        self.service.add_object("other", dict(malware(), added_at="2024-01-04T00:00:00Z"), "co-m")
+        with self.assertRaisesRegex(ValidationError, "note references unknown malware"):
+            self.add(note(object_refs=[MALWARE_ID]), "note-cross")
+
+    def test_note_can_reference_a_revoked_object(self):
+        self._seed_note_targets()
+        self.add(revoked(indicator(modified="2024-02-01T00:00:00Z")), "note-ind-rev")
+        stored = self.add(note(), "note-revoked-target")
+        self.assertEqual([INDICATOR_ID], stored["object"]["object_refs"])
+
+    def test_note_can_reference_every_supported_type_including_notes(self):
+        self._seed_note_targets()
+        self.add(malware(), "note-mal", added_at="2024-01-04T00:00:00Z")
+        self.add(relationship(), "note-rel", added_at="2024-01-05T00:00:00Z")
+        self.add(report(), "note-rep", added_at="2024-01-06T00:00:00Z")
+        self.add(note(note_id=NOTE2_ID), "note-other", added_at="2024-01-07T00:00:00Z")
+        stored = self.add(
+            note(object_refs=[IDENTITY_ID, INDICATOR_ID, MALWARE_ID, RELATIONSHIP_ID, REPORT_ID, NOTE2_ID]),
+            "note-all",
+            added_at="2024-01-08T00:00:00Z",
+        )
+        self.assertEqual(
+            [IDENTITY_ID, INDICATOR_ID, MALWARE_ID, RELATIONSHIP_ID, REPORT_ID, NOTE2_ID],
+            stored["object"]["object_refs"],
+        )
+
+    def test_report_can_reference_a_note(self):
+        self._seed_note_targets()
+        self.add(note(), "note-for-report", added_at="2024-01-04T00:00:00Z")
+        stored = self.add(
+            report(object_refs=[INDICATOR_ID, NOTE_ID]),
+            "rep-with-note",
+            added_at="2024-01-05T00:00:00Z",
+        )
+        self.assertEqual([INDICATOR_ID, NOTE_ID], stored["object"]["object_refs"])
+
+    def test_report_still_cannot_reference_a_report(self):
+        self._seed_note_targets()
+        with self.assertRaisesRegex(ValidationError, "must reference one of"):
+            self.add(report(object_refs=[REPORT2_ID]), "rep-self")
+
+    def test_note_versions_can_change_content_and_references(self):
+        self._seed_note_targets()
+        self.add(note(modified="2024-03-01T00:00:00Z"), "note-v1", added_at="2024-03-02T00:00:00Z")
+        self.add(
+            note(
+                modified="2024-04-01T00:00:00Z",
+                object_refs=[INDICATOR_ID, IDENTITY_ID],
+            ),
+            "note-v2",
+            added_at="2024-04-02T00:00:00Z",
+        )
+        current = self.service.list_objects("feed", ["note"]).to_json()["objects"][0]
+        self.assertEqual("2024-04-01T00:00:00.000000Z", current["modified"])
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID], current["object_refs"])
+        versions = self.service.object_versions("feed", NOTE_ID).to_json()
+        self.assertEqual(
+            ["2024-03-01T00:00:00.000000Z", "2024-04-01T00:00:00.000000Z"],
+            versions["versions"],
+        )
+
+    def test_note_revision_referencing_an_unknown_target_leaves_current_intact(self):
+        self._seed_note_targets()
+        self.add(note(modified="2024-03-01T00:00:00Z"), "note-v1")
+        with self.assertRaisesRegex(ValidationError, "note references unknown malware"):
+            self.add(note(modified="2024-04-01T00:00:00Z", object_refs=[MALWARE_ID]), "note-v2")
+        current = self.service.list_objects("feed", ["note"]).to_json()["objects"][0]
+        self.assertEqual("2024-03-01T00:00:00.000000Z", current["modified"])
+        self.assertEqual(
+            1, len(self.service.object_versions("feed", NOTE_ID).to_json()["versions"])
+        )
+
+    def test_note_revocation_is_terminal_and_pure(self):
+        self._seed_note_targets()
+        self.add(note(modified="2024-03-01T00:00:00Z"), "note-v1")
+        with self.assertRaisesRegex(ValidationError, "must keep every property"):
+            self.add(
+                revoked(dict(note(modified="2024-04-01T00:00:00Z"), content="changed")),
+                "note-impure",
+            )
+        self.add(revoked(note(modified="2024-04-01T00:00:00Z")), "note-v2")
+        with self.assertRaisesRegex(ConflictError, "accepts no further versions"):
+            self.add(note(modified="2024-05-01T00:00:00Z"), "note-v3")
+
+    def test_note_uses_the_delta_version_and_type_filter(self):
+        self._seed_note_targets()
+        self.add(note(), "note-v1", added_at="2024-03-02T00:00:00Z")
+        combined = self.service.list_objects("feed", ["note,identity"]).to_json()
+        self.assertEqual(["note", "identity"], combined["type"])
+        self.assertEqual(
+            [IDENTITY_ID, NOTE_ID], [item["id"] for item in combined["objects"]]
+        )
+        delta = self.service.list_objects(
+            "feed", ["note"], ["2024-03-01T23:59:59Z"]
+        ).to_json()
+        self.assertEqual([NOTE_ID], [item["id"] for item in delta["objects"]])
+        self.assertEqual(
+            [],
+            self.service.list_objects(
+                "feed", ["note"], ["2024-03-02T00:00:00Z"]
+            ).to_json()["objects"],
+        )
+
+    def test_note_paginates_with_the_other_types(self):
+        self._seed_note_targets()
+        self.add(note(), "note-v1", added_at="2024-01-04T00:00:00Z")
+        first = self.service.list_objects("feed", limit=["2"]).to_json()
+        self.assertTrue(first["more"])
+        rest = self.service.list_objects("feed", next_token=[first["next"]]).to_json()
+        seen = [item["id"] for item in first["objects"] + rest["objects"]]
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID, NOTE_ID], seen)
+        self.assertFalse(rest["more"])
 
     # ------------------------------------------------------------------ access
 
