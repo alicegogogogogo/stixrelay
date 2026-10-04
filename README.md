@@ -7,15 +7,17 @@ current state and `added_after` deltas over a TAXII-shaped HTTP API.
 
 The initial release intentionally supports a compact public contract:
 
-- five object types: `identity`, `indicator`, `malware`, `relationship`, and
-  `report`;
+- six object types: `identity`, `indicator`, `malware`, `relationship`,
+  `report`, and `note`;
 - every object is validated against a fixed property allowlist plus a required set
   that depends on its type, and its `id` must match its `type`;
 - a `relationship` can only be stored once both endpoints already exist in the
   same collection;
 - a `report` can only be stored when every entry of `object_refs` already exists
-  as the current version of an `identity`, `indicator`, `malware`, or
-  `relationship` object in the same collection;
+  as the current version of an `identity`, `indicator`, `malware`,
+  `relationship`, or `note` object in the same collection;
+- a `note` is an analyst annotation of an `identity`, `indicator`, `malware`,
+  `relationship`, `report`, or another `note` already in the same collection;
 - revisions are append only: a newer `modified` timestamp adds a version, the
   `modified` timestamp is the TAXII version identifier, and versions never regress;
 - deltas use `added_after` as a **strictly half-open** interval over the time the
@@ -76,6 +78,7 @@ Every object carries these common properties: `type`, `spec_version`, `id`,
 | `malware` | `name`, `is_family` | `description`, `malware_types`, `aliases`, `first_seen`, `last_seen`, `kill_chain_phases` |
 | `relationship` | `relationship_type`, `source_ref`, `target_ref` | `description`, `start_time`, `stop_time` |
 | `report` | `name`, `published`, `object_refs` | `description`, `report_types` |
+| `note` | `content`, `object_refs` | `abstract`, `authors` |
 
 Property rules:
 
@@ -103,15 +106,27 @@ Property rules:
   given, `start_time` must not be later;
 - a `report` requires `published` (a UTC timestamp in the same format as
   `created`/`modified`) and `object_refs`: a non-empty array of STIX identifiers
-  whose type prefix is `identity`, `indicator`, `malware`, or `relationship`.
-  Entries must be well formed, must not repeat, and must not point at the report
-  itself (a `report--` identifier is rejected). The optional `report_types` is a
-  non-empty array of non-empty strings. At write time every entry must resolve to
-  the current version of an object in the **same** collection; an unknown,
-  cross-collection, duplicated, or self reference — together with an empty array —
-  is a `validation_error` and the whole submission is rejected. A later report
-  version may add or remove entries freely; each submission is checked against the
-  objects current in the collection at that moment.
+  whose type prefix is `identity`, `indicator`, `malware`, `relationship`, or
+  `note`. Entries must be well formed, must not repeat, and must not point at the
+  report itself (a `report--` identifier is rejected). The optional `report_types`
+  is a non-empty array of non-empty strings. At write time every entry must
+  resolve to the current version of an object in the **same** collection; an
+  unknown, cross-collection, duplicated, or self reference — together with an
+  empty array — is a `validation_error` and the whole submission is rejected. A
+  later report version may add or remove entries freely; each submission is
+  checked against the objects current in the collection at that moment;
+- a `note` requires `content` (a non-empty string) and `object_refs`: a
+  non-empty, duplicate-free array of STIX identifiers whose type prefix is
+  `identity`, `indicator`, `malware`, `relationship`, `report`, or `note`. The
+  optional `abstract` is a non-empty string and the optional `authors` is a
+  non-empty array of non-empty strings. Entries must be well formed, must not
+  repeat, and must not point at the note itself. At write time every entry must
+  resolve to the current version of an object in the **same** collection (a
+  revoked target still counts as existing); an unknown, cross-collection,
+  self, or duplicate reference, an unsupported type, or an empty array is a
+  `validation_error` and the whole submission is rejected. A later note version
+  may freely edit `content`/`abstract`/`authors` and add or remove references;
+  each submission is re-checked against the objects current at that moment.
 
 Any property outside the allowlist for the object's type is rejected.
 
@@ -148,9 +163,9 @@ The `modified` timestamp **is** the TAXII version identifier of a revision.
   `latest`, and `added_at`. Historical versions stay untouched;
 - a pagination snapshot keeps the revocation state it started with: a revocation
   received after the first paged request never enters that round's later pages;
-- revocation never cascades: relationships and reports keep working, and a
-  revoked object still counts as an existing object of the collection in the
-  relationship and report reference integrity checks;
+- revocation never cascades: relationships, reports, and notes keep working, and
+  a revoked object still counts as an existing object of the collection in the
+  relationship, report, and note reference integrity checks;
 - once the current version is revoked, **any** later write to that id in the
   collection is a `409 conflict` — a later `modified`, flipping `revoked` back to
   `false`, omitting `revoked`, or changing other properties alike. Writes with the
@@ -242,8 +257,8 @@ Returns HTTP 201 with the stored object plus its storage metadata:
 `object` is the canonical form of the submission: `spec_version` is filled in,
 timestamps are normalised, and `pattern_type` defaults to `stix`. A mismatched
 `id` prefix, a missing required property, an unknown property, a `relationship`
-whose endpoints do not exist, or a `report` whose `object_refs` do not resolve in
-the same collection is a `validation_error`.
+whose endpoints do not exist, or a `report` or `note` whose `object_refs` do not
+resolve in the same collection is a `validation_error`.
 
 ### Read objects
 
@@ -338,8 +353,8 @@ Errors use this shape:
 ```
 
 Validation errors (unknown fields, unknown types, bad identifiers, bad patterns,
-missing relationship endpoints, unresolvable report `object_refs`, a revocation
-version that changes anything besides `modified` and `revoked`, bad
+missing relationship endpoints, unresolvable report or note `object_refs`, a
+revocation version that changes anything besides `modified` and `revoked`, bad
 `added_after`, bad `limit` or `next`, unsupported query parameters) return 400. Writes to a read-only collection
 return 403 (`forbidden`). Missing collections and objects — and any access to a
 collection with `can_read: false` — return 404. Version conflicts, duplicate

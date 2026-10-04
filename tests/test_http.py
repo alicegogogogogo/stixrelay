@@ -16,10 +16,12 @@ from test_service import (
     IDENTITY_ID,
     INDICATOR_ID,
     MALWARE_ID,
+    NOTE_ID,
     REPORT_ID,
     identity,
     indicator,
     malware,
+    note,
     report,
 )
 
@@ -547,6 +549,205 @@ class HttpTests(unittest.TestCase):
         self.assertEqual([reports[1][0]], [item["id"] for item in second["objects"]])
         self.assertFalse(second["more"])
 
+
+    # ------------------------------------------------------------------ notes
+
+    def test_note_flow_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "n1", "title": "Notes"}, "n0")
+
+        # A note before its reference exists is a validation error.
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/n1/objects/",
+            dict(note(), added_at="2024-02-03T00:00:00Z"),
+            "n1-bad",
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+        self.assertIn("references unknown", body["error"]["message"])
+
+        status, _ = self.request(
+            "POST",
+            "/taxii2/collections/n1/objects/",
+            dict(indicator(), added_at="2024-02-01T00:00:00Z"),
+            "n1-ind",
+        )
+        self.assertEqual(201, status)
+
+        # The rejected key now succeeds.
+        status, first = self.request(
+            "POST",
+            "/taxii2/collections/n1/objects/",
+            dict(
+                note(
+                    abstract="Heads up",
+                    authors=["alice"],
+                    object_refs=[INDICATOR_ID],
+                ),
+                added_at="2024-02-03T00:00:00Z",
+            ),
+            "n1-bad",
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(NOTE_ID, first["object"]["id"])
+        self.assertEqual("Analyst comment", first["object"]["content"])
+        self.assertEqual("Heads up", first["object"]["abstract"])
+        self.assertEqual(["alice"], first["object"]["authors"])
+        self.assertEqual([INDICATOR_ID], first["object"]["object_refs"])
+        self.assertEqual("2024-02-03T00:00:00.000000Z", first["added_at"])
+
+        # Idempotent replay returns the first response.
+        status, repeated = self.request(
+            "POST",
+            "/taxii2/collections/n1/objects/",
+            dict(
+                note(
+                    abstract="Heads up",
+                    authors=["alice"],
+                    object_refs=[INDICATOR_ID],
+                ),
+                added_at="2024-02-03T00:00:00Z",
+            ),
+            "n1-bad",
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(first, repeated)
+
+        status, body = self.request(
+            "GET", "/taxii2/collections/n1/objects/?type=note"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([NOTE_ID], [item["id"] for item in body["objects"]])
+        self.assertEqual(["note"], body["type"])
+
+        status, body = self.request(
+            "GET", f"/taxii2/collections/n1/objects/{NOTE_ID}/versions/"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["2024-01-01T00:00:00.000000Z"], body["versions"])
+
+        # A revision changes the content and drops the abstract; refs re-checked.
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/n1/objects/",
+            dict(
+                note(
+                    modified="2024-04-01T00:00:00Z",
+                    authors=["alice"],
+                    object_refs=[INDICATOR_ID],
+                ),
+                added_at="2024-04-02T00:00:00Z",
+            ),
+            "n1-v2",
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("Analyst comment", body["object"]["content"])
+        self.assertNotIn("abstract", body["object"])
+
+        status, body = self.request(
+            "GET", "/taxii2/collections/n1/objects/?added_after=2024-04-01T00:00:00Z"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([NOTE_ID], [item["id"] for item in body["objects"]])
+
+    def test_note_validation_errors_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "n2", "title": "Notes 2"}, "nn0")
+        self.request(
+            "POST",
+            "/taxii2/collections/n2/objects/",
+            dict(indicator(), added_at="2024-02-01T00:00:00Z"),
+            "nn-ind",
+        )
+        cases = (
+            dict(content=""),
+            dict(object_refs=[]),
+            dict(object_refs=[INDICATOR_ID, INDICATOR_ID]),
+            dict(object_refs=[NOTE_ID]),
+            dict(object_refs=["campaign--a1a1a1a1-1a1a-4a1a-8a1a-1a1a1a1a1a1a"]),
+            dict(object_refs=["note--nope"]),
+            dict(authors=[]),
+            dict(authors=[""]),
+            dict(authors="alice"),
+            dict(abstract=""),
+            dict(extra=1),
+        )
+        for index, overrides in enumerate(cases):
+            status, body = self.request(
+                "POST",
+                "/taxii2/collections/n2/objects/",
+                dict(
+                    note(note_id="note--d100000%d-0000-4000-8000-00000000000%d" % (index, index)),
+                    **overrides,
+                ),
+                f"nn-bad-{index}",
+            )
+            self.assertEqual(400, status, overrides)
+            self.assertEqual("validation_error", body["error"]["code"], overrides)
+
+    def test_note_revocation_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "n3", "title": "Notes 3"}, "nr0")
+        self.request(
+            "POST",
+            "/taxii2/collections/n3/objects/",
+            dict(indicator(), added_at="2024-02-01T00:00:00Z"),
+            "nr-ind",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections/n3/objects/",
+            dict(note(), added_at="2024-02-03T00:00:00Z"),
+            "nr1",
+        )
+        good = dict(
+            note(modified="2024-03-01T00:00:00Z"),
+            revoked=True,
+            added_at="2024-03-02T00:00:00Z",
+        )
+        status, body = self.request("POST", "/taxii2/collections/n3/objects/", good, "nr2")
+        self.assertEqual(201, status)
+        self.assertIs(body["object"]["revoked"], True)
+
+        follow_up = dict(
+            note(modified="2024-04-01T00:00:00Z"),
+            added_at="2024-04-02T00:00:00Z",
+        )
+        status, body = self.request(
+            "POST", "/taxii2/collections/n3/objects/", follow_up, "nr3"
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", body["error"]["code"])
+
+    def test_report_can_reference_a_note_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "n4", "title": "Notes 4"}, "nq0")
+        self.request(
+            "POST",
+            "/taxii2/collections/n4/objects/",
+            dict(indicator(), added_at="2024-02-01T00:00:00Z"),
+            "nq-ind",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections/n4/objects/",
+            dict(
+                note(modified="2024-03-01T00:00:00Z"),
+                added_at="2024-03-02T00:00:00Z",
+            ),
+            "nq-note",
+        )
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/n4/objects/",
+            dict(
+                report(
+                    modified="2024-04-01T00:00:00Z",
+                    object_refs=[INDICATOR_ID, NOTE_ID],
+                ),
+                added_at="2024-04-02T00:00:00Z",
+            ),
+            "nq-report",
+        )
+        self.assertEqual(201, status)
+        self.assertEqual([INDICATOR_ID, NOTE_ID], body["object"]["object_refs"])
 
     # -------------------------------------------------------------- revocation
 

@@ -8,17 +8,28 @@ from typing import Any
 from .errors import ValidationError
 
 # Object types this release can store, and the STIX id prefix each one uses.
-OBJECT_TYPES = ("identity", "indicator", "malware", "relationship", "report")
+OBJECT_TYPES = ("identity", "indicator", "malware", "relationship", "report", "note")
 ID_PREFIX = {
     "identity": "identity",
     "indicator": "indicator",
     "malware": "malware",
     "relationship": "relationship",
     "report": "report",
+    "note": "note",
 }
 
 # A report may only point at these object types through `object_refs`.
-REPORT_REF_TYPES = ("identity", "indicator", "malware", "relationship")
+REPORT_REF_TYPES = ("identity", "indicator", "malware", "relationship", "note")
+# A note may annotate any object this release stores, including another note (but
+# never itself, which StixObject.parse enforces once the id is known).
+NOTE_REF_TYPES = (
+    "identity",
+    "indicator",
+    "malware",
+    "relationship",
+    "report",
+    "note",
+)
 
 # Character classes are written as explicit alternations: a literal hyphen inside a
 # bracket expression is easy to mis-read (and can leak unexpected characters into
@@ -105,6 +116,12 @@ TYPE_PROPERTIES: dict[str, dict[str, str]] = {
         "report_types": "string_array",
         "object_refs": "report_refs",
     },
+    "note": {
+        "abstract": "string",
+        "content": "string",
+        "authors": "string_array",
+        "object_refs": "note_refs",
+    },
 }
 
 REQUIRED_PROPERTIES: dict[str, tuple[str, ...]] = {
@@ -113,6 +130,7 @@ REQUIRED_PROPERTIES: dict[str, tuple[str, ...]] = {
     "malware": ("name", "is_family"),
     "relationship": ("relationship_type", "source_ref", "target_ref"),
     "report": ("name", "published", "object_refs"),
+    "note": ("content", "object_refs"),
 }
 
 MEDIA_TYPE = "application/stix+json;version=2.1"
@@ -269,6 +287,25 @@ def _validate_report_refs(value: Any, field: str) -> list[str]:
     return references
 
 
+def _validate_note_refs(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValidationError(f"{field} must be a non-empty array of STIX identifiers")
+    references: list[str] = []
+    for index, item in enumerate(value):
+        location = f"{field}[{index}]"
+        reference = validate_identifier(item, location)
+        target_type = identifier_type(reference)
+        if target_type not in NOTE_REF_TYPES:
+            raise ValidationError(
+                f"{location} must reference one of {', '.join(NOTE_REF_TYPES)};"
+                f" got {target_type}"
+            )
+        if reference in references:
+            raise ValidationError(f"{field} must not contain the duplicate reference {reference}")
+        references.append(reference)
+    return references
+
+
 def _validate_property(value: Any, kind: str, field: str) -> Any:
     if kind == "string":
         return _validate_string(value, field)
@@ -288,6 +325,8 @@ def _validate_property(value: Any, kind: str, field: str) -> Any:
         return _validate_relationship_type(value, field)
     if kind == "report_refs":
         return _validate_report_refs(value, field)
+    if kind == "note_refs":
+        return _validate_note_refs(value, field)
     if kind == "external_references":
         return _validate_external_references(value, field)
     if kind == "kill_chain_phases":
@@ -372,7 +411,16 @@ class StixObject:
             properties["pattern_type"] = "stix"
         if type_name == "relationship":
             cls._validate_relationship(properties)
+        if type_name == "note":
+            cls._validate_note(identifier, properties)
         return cls(type_name, identifier, created, modified, properties)
+
+    @staticmethod
+    def _validate_note(identifier: str, properties: dict[str, Any]) -> None:
+        # object_refs is structurally validated above; the one rule that needs the
+        # note's own id is that a note may not annotate itself.
+        if identifier in properties["object_refs"]:
+            raise ValidationError("note object_refs must not reference the note itself")
 
     @staticmethod
     def _validate_relationship(properties: dict[str, Any]) -> None:
@@ -395,7 +443,7 @@ class StixObject:
     def references(self) -> tuple[str, ...]:
         if self.type == "relationship":
             return (self.properties["source_ref"], self.properties["target_ref"])
-        if self.type == "report":
+        if self.type in ("report", "note"):
             return tuple(self.properties["object_refs"])
         return ()
 
