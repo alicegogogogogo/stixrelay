@@ -18,6 +18,8 @@ from .model import (
 from .store import Store
 
 COLLECTION_PROPERTIES = ("id", "title", "description", "can_read", "can_write")
+EXPORT_FORMATS = ("stix", "ndjson")
+EXPORT_VERSIONS = ("current", "all")
 
 
 @dataclass(frozen=True)
@@ -315,6 +317,60 @@ class StixRelay:
         if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], str):
             raise ValidationError("next is not a valid cursor for this service")
         return raw[0]
+
+    def _export_choice(self, raw: Any, field: str, choices: tuple[str, ...]) -> str:
+        if raw is None:
+            return choices[0]
+        if not isinstance(raw, list) or len(raw) != 1:
+            raise ValidationError(f"{field} must be supplied exactly once")
+        if raw[0] not in choices:
+            raise ValidationError(f"{field} must be one of {', '.join(choices)}")
+        return raw[0]
+
+    def export_objects(
+        self,
+        collection_id: str,
+        type_filter: Any = None,
+        added_after: Any = None,
+        *,
+        format: Any = None,
+        versions: Any = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Read-only export: no snapshot, cursor, version, or idempotency writes."""
+        self._require_readable(collection_id)
+        export_format = self._export_choice(format, "format", EXPORT_FORMATS)
+        requested = self._identity(type_filter) if type_filter is not None else None
+        cutoff = self._added_after(added_after)
+        if self._export_choice(versions, "versions", EXPORT_VERSIONS) == "all":
+            documents = self._all_documents(collection_id, requested, cutoff)
+        else:
+            documents = self._current_documents(
+                self.store.connection, collection_id, requested, cutoff
+            )
+        return export_format, documents
+
+    def _all_documents(
+        self,
+        collection_id: str,
+        requested: tuple[str, ...] | None,
+        cutoff: str | None,
+    ) -> list[dict[str, Any]]:
+        """Every stored version matching the filters, each exactly once."""
+        sql = "SELECT document, added_at FROM objects WHERE collection_id = ?"
+        parameters: list[Any] = [collection_id]
+        if requested is not None:
+            placeholders = ", ".join("?" for _ in requested)
+            sql += f" AND type IN ({placeholders})"
+            parameters.extend(requested)
+        sql += " ORDER BY added_at, object_id, version"
+        rows = self.store.connection.execute(sql, parameters).fetchall()
+
+        documents: list[dict[str, Any]] = []
+        for row in rows:
+            if cutoff is not None and timestamp_value(row["added_at"]) <= timestamp_value(cutoff):
+                continue
+            documents.append(self.store.decode(row["document"]))
+        return documents
 
     def _current_documents(
         self,

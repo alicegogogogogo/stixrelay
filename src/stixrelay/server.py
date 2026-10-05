@@ -2,12 +2,35 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .errors import NotFoundError, StixRelayError, ValidationError
+from .model import MEDIA_TYPE
 from .service import StixRelay
+
+
+@dataclass(frozen=True)
+class RawResponse:
+    """A pre-serialized body with its own Content-Type (used by collection export)."""
+
+    body: bytes
+    content_type: str
+
+
+def _export_response(export_format: str, documents: list[dict[str, Any]]) -> RawResponse:
+    if export_format == "ndjson":
+        body = b"".join(
+            json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+            for document in documents
+        )
+        return RawResponse(body, "application/x-ndjson")
+    bundle = {"type": "bundle", "objects": documents}
+    return RawResponse(
+        json.dumps(bundle, ensure_ascii=False, separators=(",", ":")).encode(), MEDIA_TYPE
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -18,8 +41,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, value: Any) -> None:
         body = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()
+        self._raw(status, body, "application/taxii+json;version=2.1")
+
+    def _raw(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/taxii+json;version=2.1")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -46,9 +72,17 @@ class Handler(BaseHTTPRequestHandler):
             and parts[3] == "objects"
             and self.command == "GET"
         )
+        export_route = (
+            len(parts) == 4
+            and parts[:2] == ["taxii2", "collections"]
+            and parts[3] == "export"
+            and self.command == "GET"
+        )
         allowed = {"type", "added_after"}
         if objects_route:
             allowed |= {"limit", "next"}
+        if export_route:
+            allowed |= {"format", "versions"}
         extra = sorted(set(query) - allowed)
         if extra:
             raise ValidationError(f"unsupported query parameters: {', '.join(extra)}")
@@ -87,6 +121,15 @@ class Handler(BaseHTTPRequestHandler):
                     added_at,
                 )
                 return result.status, result.to_json()
+        if export_route:
+            export_format, documents = self.service.export_objects(
+                parts[2],
+                query.get("type"),
+                query.get("added_after"),
+                format=query.get("format"),
+                versions=query.get("versions"),
+            )
+            return 200, _export_response(export_format, documents)
         if (
             len(parts) == 6
             and parts[:2] == ["taxii2", "collections"]
@@ -101,7 +144,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle(self) -> None:
         try:
             status, response = self._dispatch()
-            self._json(status, response)
+            if isinstance(response, RawResponse):
+                self._raw(status, response.body, response.content_type)
+            else:
+                self._json(status, response)
         except StixRelayError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
         except Exception:

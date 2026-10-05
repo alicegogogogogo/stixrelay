@@ -1469,6 +1469,151 @@ class StixRelayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "modified or was not issued"):
             self.service.list_objects("feed", next_token=[token])
 
+    # ------------------------------------------------------------------- export
+
+    def test_export_current_matches_the_unpaginated_listing(self):
+        self.add(identity(), "e1", added_at="2024-01-02T00:00:00Z")
+        self.add(indicator(), "e2", added_at="2024-01-02T00:00:00Z")
+        self.add(
+            identity(modified="2024-02-01T00:00:00Z"), "e3", added_at="2024-03-02T00:00:00Z"
+        )
+        export_format, documents = self.service.export_objects("feed")
+        self.assertEqual("stix", export_format)
+        self.assertEqual(
+            self.service.list_objects("feed").to_json()["objects"], documents
+        )
+        self.assertEqual(
+            ["2024-02-01T00:00:00.000000Z"],
+            [d["modified"] for d in documents if d["id"] == IDENTITY_ID],
+        )
+
+    def test_export_all_returns_every_version_once_in_added_at_order(self):
+        self.add(identity(), "e1", added_at="2024-01-02T00:00:00Z")
+        self.add(indicator(), "e2", added_at="2024-01-03T00:00:00Z")
+        self.add(
+            identity(modified="2024-02-01T00:00:00Z"), "e3", added_at="2024-03-02T00:00:00Z"
+        )
+        export_format, documents = self.service.export_objects("feed", versions=["all"])
+        self.assertEqual("stix", export_format)
+        self.assertEqual(
+            [
+                (IDENTITY_ID, "2024-01-01T00:00:00.000000Z"),
+                (INDICATOR_ID, "2024-01-01T00:00:00.000000Z"),
+                (IDENTITY_ID, "2024-02-01T00:00:00.000000Z"),
+            ],
+            [(d["id"], d["modified"]) for d in documents],
+        )
+
+    def test_export_all_orders_ties_by_id_then_modified(self):
+        self.add(indicator(), "e1", added_at="2024-01-02T00:00:00Z")
+        self.add(identity(), "e2", added_at="2024-01-02T00:00:00Z")
+        self.add(
+            identity(modified="2024-02-01T00:00:00Z"), "e3", added_at="2024-01-02T00:00:00Z"
+        )
+        _, documents = self.service.export_objects("feed", versions=["all"])
+        self.assertEqual(
+            [IDENTITY_ID, IDENTITY_ID, INDICATOR_ID], [d["id"] for d in documents]
+        )
+        self.assertEqual(
+            ["2024-01-01T00:00:00.000000Z", "2024-02-01T00:00:00.000000Z"],
+            [d["modified"] for d in documents[:2]],
+        )
+
+    def test_export_all_applies_added_after_to_each_version(self):
+        self.add(identity(), "e1", added_at="2024-01-02T00:00:00Z")
+        self.add(
+            identity(modified="2024-02-01T00:00:00Z"), "e2", added_at="2024-03-02T00:00:00Z"
+        )
+        _, documents = self.service.export_objects(
+            "feed", None, ["2024-02-01T00:00:00Z"], versions=["all"]
+        )
+        self.assertEqual(["2024-02-01T00:00:00.000000Z"], [d["modified"] for d in documents])
+        _, documents = self.service.export_objects(
+            "feed", None, ["2024-03-02T00:00:00Z"], versions=["all"]
+        )
+        self.assertEqual([], documents)
+
+    def test_export_keeps_revoked_objects_and_their_history(self):
+        self.add(identity(), "e1", added_at="2024-01-02T00:00:00Z")
+        self.add(
+            revoked(identity(modified="2024-02-01T00:00:00Z")),
+            "e2",
+            added_at="2024-03-02T00:00:00Z",
+        )
+        _, current = self.service.export_objects("feed")
+        self.assertEqual([True], [d["revoked"] for d in current])
+        _, history = self.service.export_objects("feed", versions=["all"])
+        self.assertEqual([False, True], [bool(d.get("revoked")) for d in history])
+
+    def test_export_formats_describe_the_same_objects_in_the_same_order(self):
+        self.add(identity(), "e1", added_at="2024-01-02T00:00:00Z")
+        self.add(
+            identity(modified="2024-02-01T00:00:00Z"), "e2", added_at="2024-03-02T00:00:00Z"
+        )
+        for versions in (None, ["all"]):
+            _, stix_documents = self.service.export_objects(
+                "feed", format=["stix"], versions=versions
+            )
+            ndjson_format, ndjson_documents = self.service.export_objects(
+                "feed", format=["ndjson"], versions=versions
+            )
+            self.assertEqual("ndjson", ndjson_format)
+            self.assertEqual(stix_documents, ndjson_documents)
+
+    def test_export_type_filter_and_added_after_follow_listing_rules(self):
+        self.add(identity(), "e1", added_at="2024-01-02T00:00:00Z")
+        self.add(indicator(), "e2", added_at="2024-01-03T00:00:00Z")
+        _, documents = self.service.export_objects("feed", ["indicator"])
+        self.assertEqual([INDICATOR_ID], [d["id"] for d in documents])
+        _, documents = self.service.export_objects("feed", None, ["2024-01-02T00:00:00Z"])
+        self.assertEqual([INDICATOR_ID], [d["id"] for d in documents])
+        with self.assertRaisesRegex(ValidationError, "type must be one of"):
+            self.service.export_objects("feed", ["campaign"])
+        with self.assertRaisesRegex(ValidationError, "added_after"):
+            self.service.export_objects("feed", None, ["not-a-timestamp"])
+
+    def test_export_format_and_versions_are_validated(self):
+        with self.assertRaisesRegex(ValidationError, "format must be supplied exactly once"):
+            self.service.export_objects("feed", format=["stix", "ndjson"])
+        with self.assertRaisesRegex(ValidationError, "format must be one of"):
+            self.service.export_objects("feed", format=["xml"])
+        with self.assertRaisesRegex(ValidationError, "versions must be supplied exactly once"):
+            self.service.export_objects("feed", versions=["all", "current"])
+        with self.assertRaisesRegex(ValidationError, "versions must be one of"):
+            self.service.export_objects("feed", versions=["everything"])
+
+    def test_export_unknown_or_unreadable_collection_is_not_found(self):
+        self.service.create_collection(
+            {"id": "private", "title": "Private", "can_read": False}, "ep1"
+        )
+        for collection_id in ("missing", "private"):
+            with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
+                self.service.export_objects(collection_id)
+            # Parameter errors must not reveal the collection either.
+            with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
+                self.service.export_objects(collection_id, format=["xml"])
+
+    def test_export_of_an_empty_collection_is_empty(self):
+        for versions in (None, ["all"]):
+            export_format, documents = self.service.export_objects("feed", versions=versions)
+            self.assertEqual("stix", export_format)
+            self.assertEqual([], documents)
+
+    def test_export_creates_no_snapshots_or_idempotency_records(self):
+        self.add(identity(), "e1")
+        self.service.export_objects("feed", versions=["all"])
+        self.service.export_objects("feed", format=["ndjson"])
+        for table in ("snapshots", "snapshot_entries"):
+            count = self.service.store.connection.execute(
+                f"SELECT COUNT(*) AS count FROM {table}"
+            ).fetchone()["count"]
+            self.assertEqual(0, count)
+        # Only the writes that seeded the collection and the object are recorded.
+        keys = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS count FROM idempotency"
+        ).fetchone()["count"]
+        self.assertEqual(2, keys)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -829,6 +829,157 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(409, status)
         self.assertEqual("conflict", body["error"]["code"])
 
+    # ------------------------------------------------------------------- export
+
+    def raw_request(self, method: str, path: str):
+        request = urllib.request.Request(self.base + path, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.headers, response.read()
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, error.headers, error.read()
+            finally:
+                error.close()
+
+    def test_export_stix_bundle_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "x1", "title": "Export one"}, "x1")
+        self.request(
+            "POST",
+            "/taxii2/collections/x1/objects/",
+            dict(identity(), added_at="2024-01-02T00:00:00Z"),
+            "x2",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections/x1/objects/",
+            dict(identity(modified="2024-02-01T00:00:00Z"), added_at="2024-03-02T00:00:00Z"),
+            "x3",
+        )
+        status, headers, body = self.raw_request("GET", "/taxii2/collections/x1/export/")
+        self.assertEqual(200, status)
+        self.assertEqual("application/stix+json;version=2.1", headers["Content-Type"])
+        bundle = json.loads(body)
+        self.assertEqual({"type", "objects"}, set(bundle))
+        self.assertEqual("bundle", bundle["type"])
+        self.assertEqual(1, len(bundle["objects"]))
+        document = bundle["objects"][0]
+        self.assertEqual(IDENTITY_ID, document["id"])
+        self.assertEqual("2024-02-01T00:00:00.000000Z", document["modified"])
+        for metadata in ("added_at", "collection_id", "version"):
+            self.assertNotIn(metadata, document)
+
+        # The path is also accepted without a trailing slash.
+        again = self.raw_request("GET", "/taxii2/collections/x1/export")
+        self.assertEqual(200, again[0])
+        self.assertEqual(body, again[2])
+
+    def test_export_ndjson_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "x2", "title": "Export two"}, "x4")
+        self.request(
+            "POST",
+            "/taxii2/collections/x2/objects/",
+            dict(identity(), added_at="2024-01-02T00:00:00Z"),
+            "x5",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections/x2/objects/",
+            dict(indicator(), added_at="2024-01-03T00:00:00Z"),
+            "x6",
+        )
+        status, headers, body = self.raw_request(
+            "GET", "/taxii2/collections/x2/export/?format=ndjson"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("application/x-ndjson", headers["Content-Type"])
+        self.assertTrue(body.endswith(b"\n"))
+        documents = [json.loads(line) for line in body.decode().splitlines()]
+        self.assertEqual([IDENTITY_ID, INDICATOR_ID], [d["id"] for d in documents])
+
+        # Both formats express the same objects in the same order.
+        stix = self.raw_request("GET", "/taxii2/collections/x2/export/?format=stix")
+        self.assertEqual(200, stix[0])
+        self.assertEqual(documents, json.loads(stix[2])["objects"])
+
+    def test_export_all_versions_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "x3", "title": "Export three"}, "x7")
+        self.request(
+            "POST",
+            "/taxii2/collections/x3/objects/",
+            dict(identity(), added_at="2024-01-02T00:00:00Z"),
+            "x8",
+        )
+        self.request(
+            "POST",
+            "/taxii2/collections/x3/objects/",
+            dict(identity(modified="2024-02-01T00:00:00Z"), added_at="2024-03-02T00:00:00Z"),
+            "x9",
+        )
+        status, _, body = self.raw_request("GET", "/taxii2/collections/x3/export/?versions=all")
+        self.assertEqual(200, status)
+        self.assertEqual(
+            ["2024-01-01T00:00:00.000000Z", "2024-02-01T00:00:00.000000Z"],
+            [d["modified"] for d in json.loads(body)["objects"]],
+        )
+        # added_after applies to each version's own added_at.
+        status, _, body = self.raw_request(
+            "GET",
+            "/taxii2/collections/x3/export/?versions=all&added_after=2024-02-01T00:00:00Z",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(
+            ["2024-02-01T00:00:00.000000Z"],
+            [d["modified"] for d in json.loads(body)["objects"]],
+        )
+
+    def test_export_empty_results_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "x4", "title": "Export four"}, "x10")
+        status, _, body = self.raw_request("GET", "/taxii2/collections/x4/export/")
+        self.assertEqual(200, status)
+        self.assertEqual({"type": "bundle", "objects": []}, json.loads(body))
+        status, headers, body = self.raw_request(
+            "GET", "/taxii2/collections/x4/export/?format=ndjson"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("application/x-ndjson", headers["Content-Type"])
+        self.assertEqual(b"", body)
+
+    def test_export_validation_errors_over_http(self):
+        self.request("POST", "/taxii2/collections", {"id": "x5", "title": "Export five"}, "x11")
+        for path in (
+            "/taxii2/collections/x5/export/?format=xml",
+            "/taxii2/collections/x5/export/?format=stix&format=ndjson",
+            "/taxii2/collections/x5/export/?versions=everything",
+            "/taxii2/collections/x5/export/?versions=all&versions=current",
+            "/taxii2/collections/x5/export/?type=campaign",
+            "/taxii2/collections/x5/export/?added_after=not-a-time",
+            "/taxii2/collections/x5/export/?limit=10",
+            "/taxii2/collections/x5/export/?next=abc",
+            "/taxii2/collections/x5/export/?bogus=1",
+        ):
+            status, body = self.request("GET", path)
+            self.assertEqual(400, status, path)
+            self.assertEqual("validation_error", body["error"]["code"], path)
+
+    def test_export_keeps_not_found_semantics(self):
+        self.request(
+            "POST",
+            "/taxii2/collections",
+            {"id": "x6", "title": "Export six", "can_read": False},
+            "x12",
+        )
+        for path in (
+            "/taxii2/collections/missing/export/",
+            "/taxii2/collections/x6/export/",
+            "/taxii2/collections/missing/export/?format=xml",
+            "/taxii2/collections/x6/export/?format=xml",
+        ):
+            status, body = self.request("GET", path)
+            self.assertEqual(404, status, path)
+            self.assertEqual("not_found", body["error"]["code"], path)
+            self.assertEqual("collection access is denied", body["error"]["message"], path)
+
 
 if __name__ == "__main__":
     unittest.main()

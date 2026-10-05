@@ -344,6 +344,39 @@ Returns every revision of one object, oldest first:
 
 An object with no revision in that collection is `not_found`.
 
+### Export a collection
+
+```http
+GET /taxii2/collections/feed/export/?format=stix&versions=current
+```
+
+Exports every matching object of a readable collection in one response, with or
+without the trailing slash. The usual `type` and `added_after` filters keep their
+exact listing semantics; `limit` and `next` do not exist here — an export is
+never paginated and never creates a snapshot, cursor, version, or idempotency
+record.
+
+- `format` is optional and defaults to `stix`. `format=stix` returns
+  `application/stix+json;version=2.1` with a body containing exactly
+  `{"type":"bundle","objects":[...]}` — the objects carry no `added_at`,
+  `collection_id`, `version`, or other storage metadata. `format=ndjson` returns
+  `application/x-ndjson` with one complete object per line, each line terminated
+  by a newline. Both formats express the same objects in the same order, and an
+  empty result is an empty `objects` array or a zero-byte body;
+- `versions` is optional and defaults to `current`, which exports the current
+  version of each object in the same order as the un-paginated object read.
+  `versions=all` exports every matching historical version, each exactly once,
+  ordered by `added_at`, then object id, then `modified`; here `added_after`
+  applies strictly to each version's own `added_at`;
+- revoked objects are never hidden: `current` exports the current revocation
+  version and `all` keeps the history before and after it.
+
+A repeated `format` or `versions`, an unsupported value, an invalid `type` or
+`added_after`, and any unknown query parameter (including `limit` and `next`)
+is a `validation_error`. Access is checked first: an unknown collection or one
+with `can_read: false` is `not_found` with `collection access is denied`,
+whatever the parameters say.
+
 ## Errors
 
 Errors use this shape:
