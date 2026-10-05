@@ -396,6 +396,49 @@ Repeated or unsupported `format`/`versions`, an invalid `type` or
 `400 validation_error`. Parameter validation runs only after the collection
 read check, so a bad query against an unreadable collection stays `404`.
 
+### Match observations against indicators
+
+```http
+POST /taxii2/collections/feed/matches
+
+{"observations":{"file:hashes.'SHA-256'":"aa"},"include_revoked":false}
+```
+
+The path is accepted with or without its trailing slash. This is a read-only
+lookup, not an object write: it needs no `Idempotency-Key` and creates no
+version, cursor, snapshot, or idempotency record. The collection read check
+runs before the body is validated, so an unknown or `can_read: false`
+collection is the usual `404 not_found` no matter how bad the body is.
+
+The body is a JSON object with exactly two allowed properties:
+
+- `observations` (required): a non-empty JSON object whose keys are the
+  complete object paths of indicator patterns (for example
+  `file:hashes.'SHA-256'`) and whose values are strings, finite numbers, or
+  booleans;
+- `include_revoked` (optional, default `false`): a boolean. When `true`,
+  indicators whose current version is revoked are evaluated too.
+
+Only the current version of each indicator in the collection is evaluated;
+revoked current versions are skipped unless `include_revoked` is `true`. The
+object path of a pattern is its complete left-hand side exactly as written —
+case and quotes are significant, and whitespace around the operator is not
+part of the path. A pattern whose path has no observation does not match.
+`=` and `!=` compare by value only when both sides share a JSON basic type
+(a boolean is never a number); `<`, `>`, `<=`, and `>=` compare numbers only
+and never match any other type.
+
+```json
+{"matches":[{"id":"indicator--...","modified":"2024-01-01T00:00:00.000000Z","pattern":"[file:hashes.'SHA-256' = 'aa']"}],"count":1}
+```
+
+Each indicator appears at most once, the matches are sorted by `id`, and
+`count` is their number; with no hits the response is
+`{"matches":[],"count":0}`. A body that is not an object, a missing, empty,
+or non-object `observations`, an empty or non-string key, a value that is not
+a string, finite number, or boolean, a non-boolean `include_revoked`, or any
+unknown property is a `400 validation_error`.
+
 ## Errors
 
 Errors use this shape:

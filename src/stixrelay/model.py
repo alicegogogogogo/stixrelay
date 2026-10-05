@@ -55,6 +55,14 @@ PATTERN = re.compile(
     r"\[" + _OBJECT_PATH + r":" + _PROPERTY_CHAR + r"*[A-Za-z0-9_']" + r"\s*"
     + _COMPARISON + r"\s*" + _VALUE + r"\]"
 )
+# The same grammar with the three parts captured, used to evaluate a stored
+# pattern against observed values. The path keeps its exact spelling; the
+# whitespace around the operator stays outside the captured groups.
+_PATTERN_PARTS = re.compile(
+    r"\[(" + _OBJECT_PATH + r":" + _PROPERTY_CHAR + r"*[A-Za-z0-9_']" r")\s*"
+    + r"(=|!=|<=|>=|<|>)\s*"
+    + r"('[^']*'|[-]?[0-9]+(?:\.[0-9]+)?|true|false)\]"
+)
 
 # Properties every STIX object in this release may carry, with their JSON type.
 COMMON_PROPERTIES: dict[str, str] = {
@@ -259,6 +267,31 @@ def _validate_pattern(value: Any, field: str) -> str:
             "[object-type:property = 'value'] using one of =, !=, <, >, <=, >="
         )
     return text
+
+
+def parse_pattern(text: str) -> tuple[str, str, Any] | None:
+    """Split a validated single-comparison pattern into path, operator, value.
+
+    The object path is the complete left-hand side exactly as written (case
+    and quotes included); whitespace around the operator is not part of it.
+    The literal becomes a string, a number, or a boolean. Returns ``None``
+    for text that is not a single-comparison pattern.
+    """
+    match = _PATTERN_PARTS.fullmatch(text)
+    if match is None:
+        return None
+    path, operator, literal = match.groups()
+    if literal.startswith("'"):
+        value: Any = literal[1:-1]
+    elif literal == "true":
+        value = True
+    elif literal == "false":
+        value = False
+    elif "." in literal:
+        value = float(literal)
+    else:
+        value = int(literal)
+    return path, operator, value
 
 
 def _validate_relationship_type(value: Any, field: str) -> str:

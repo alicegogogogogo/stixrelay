@@ -83,6 +83,20 @@ class Handler(BaseHTTPRequestHandler):
                 return result.status, result.to_json()
         if len(parts) == 3 and parts[:2] == ["taxii2", "collections"] and self.command == "GET":
             return 200, self.service.get_collection(parts[2])
+        if (
+            len(parts) == 4
+            and parts[:2] == ["taxii2", "collections"]
+            and parts[3] == "matches"
+        ):
+            if self.command != "POST":
+                raise NotFoundError("route was not found")
+            # Like the export route, the collection read check runs before the
+            # body is parsed or validated, so a bad body never reveals existence.
+            # Matching is read only: no Idempotency-Key is required and nothing
+            # is stored.
+            self.service.get_collection(parts[2])
+            body = self._body()
+            return 200, self.service.match_indicators(parts[2], body)
         if len(parts) == 4 and parts[:2] == ["taxii2", "collections"] and parts[3] == "objects":
             collection_id = parts[2]
             if self.command == "GET":

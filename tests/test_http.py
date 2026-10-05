@@ -1021,6 +1021,162 @@ class HttpTests(unittest.TestCase):
             body["versions"],
         )
 
+    # ----------------------------------------------------------------- matches
+
+    MATCH_INDICATOR_ID = "indicator--00000000-0000-4000-8000-0000000000aa"
+
+    def _seed_matches_collection(self, collection_id="mt1", key_prefix="mt"):
+        self.request(
+            "POST",
+            "/taxii2/collections",
+            {"id": collection_id, "title": "Matches"},
+            f"{key_prefix}0",
+        )
+        payload = dict(
+            indicator(),
+            id=self.MATCH_INDICATOR_ID,
+            pattern="[file:hashes.'SHA-256' = 'aa']",
+            added_at="2024-01-02T00:00:00Z",
+        )
+        status, _ = self.request(
+            "POST", f"/taxii2/collections/{collection_id}/objects/", payload, f"{key_prefix}1"
+        )
+        self.assertEqual(201, status)
+
+    def test_matches_flow_over_http(self):
+        self._seed_matches_collection()
+        # Read only: no Idempotency-Key is required.
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/mt1/matches",
+            {"observations": {"file:hashes.'SHA-256'": "aa"}},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["matches", "count"], list(body))
+        self.assertEqual(1, body["count"])
+        self.assertEqual(
+            [
+                {
+                    "id": self.MATCH_INDICATOR_ID,
+                    "modified": "2024-01-01T00:00:00.000000Z",
+                    "pattern": "[file:hashes.'SHA-256' = 'aa']",
+                }
+            ],
+            body["matches"],
+        )
+        # A miss is an empty result, and the trailing slash is accepted.
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/mt1/matches/",
+            {"observations": {"file:hashes.'SHA-256'": "bb"}},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual({"matches": [], "count": 0}, body)
+        # Matching changed nothing: the object and its history read as before.
+        status, body = self.request("GET", "/taxii2/collections/mt1/objects/")
+        self.assertEqual(200, status)
+        self.assertEqual(
+            [self.MATCH_INDICATOR_ID], [item["id"] for item in body["objects"]]
+        )
+        status, body = self.request(
+            "GET", f"/taxii2/collections/mt1/objects/{self.MATCH_INDICATOR_ID}/versions/"
+        )
+        self.assertEqual(["2024-01-01T00:00:00.000000Z"], body["versions"])
+        # Only POST is routed.
+        status, body = self.request("GET", "/taxii2/collections/mt1/matches")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", body["error"]["code"])
+
+    def test_matches_access_check_precedes_body_validation_over_http(self):
+        self.request(
+            "POST",
+            "/taxii2/collections",
+            {"id": "mt-hidden", "title": "Hidden", "can_read": False},
+            "mth0",
+        )
+        for collection_id in ("mt-hidden", "mt-missing"):
+            for payload in ({"unknown": 1}, {"observations": {}}, ["not", "a", "dict"]):
+                status, body = self.request(
+                    "POST", f"/taxii2/collections/{collection_id}/matches", payload
+                )
+                self.assertEqual(404, status, (collection_id, payload))
+                self.assertEqual(
+                    {"error": {"code": "not_found", "message": "collection access is denied"}},
+                    body,
+                    (collection_id, payload),
+                )
+        # Even an unparseable body stays a 404 for a missing collection.
+        request = urllib.request.Request(
+            self.base + "/taxii2/collections/mt-missing/matches",
+            data=b"{broken",
+            method="POST",
+        )
+        request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                status = response.status
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            try:
+                status = error.code
+                payload = json.loads(error.read())
+            finally:
+                error.close()
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", payload["error"]["code"])
+
+    def test_matches_validation_errors_over_http(self):
+        self.request(
+            "POST", "/taxii2/collections", {"id": "mt2", "title": "Matches 2"}, "mtv0"
+        )
+        bad_bodies = (
+            {},
+            {"include_revoked": True},
+            {"observations": {}},
+            {"observations": []},
+            {"observations": "file:name"},
+            {"observations": {"": "x"}},
+            {"observations": {"a": None}},
+            {"observations": {"a": [1]}},
+            {"observations": {"a": {"b": 1}}},
+            {"observations": {"a": 1}, "include_revoked": "yes"},
+            {"observations": {"a": 1}, "unknown": 1},
+            ["not", "a", "dict"],
+        )
+        for payload in bad_bodies:
+            status, body = self.request("POST", "/taxii2/collections/mt2/matches", payload)
+            self.assertEqual(400, status, payload)
+            self.assertEqual("validation_error", body["error"]["code"], payload)
+
+    def test_matches_revoked_indicator_needs_the_flag_over_http(self):
+        self._seed_matches_collection("mt3", "mtr")
+        revocation = dict(
+            indicator(),
+            id=self.MATCH_INDICATOR_ID,
+            pattern="[file:hashes.'SHA-256' = 'aa']",
+            modified="2024-02-01T00:00:00Z",
+            revoked=True,
+            added_at="2024-02-02T00:00:00Z",
+        )
+        status, _ = self.request(
+            "POST", "/taxii2/collections/mt3/objects/", revocation, "mtr2"
+        )
+        self.assertEqual(201, status)
+        observation = {"observations": {"file:hashes.'SHA-256'": "aa"}}
+        status, body = self.request("POST", "/taxii2/collections/mt3/matches", observation)
+        self.assertEqual(200, status)
+        self.assertEqual({"matches": [], "count": 0}, body)
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/mt3/matches",
+            dict(observation, include_revoked=True),
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(1, body["count"])
+        self.assertEqual(
+            "2024-02-01T00:00:00.000000Z", body["matches"][0]["modified"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -14,6 +15,7 @@ from .model import (
     StixObject,
     canonical_timestamp,
     identifier_type,
+    parse_pattern,
     timestamp_value,
 )
 from .store import Store
@@ -24,6 +26,8 @@ NDJSON_MEDIA_TYPE = "application/x-ndjson"
 EXPORT_FORMATS = ("stix", "ndjson")
 EXPORT_VERSIONS = ("current", "all")
 EXPORT_QUERY_PARAMETERS = ("type", "added_after", "format", "versions")
+
+MATCHES_PROPERTIES = ("observations", "include_revoked")
 
 
 @dataclass(frozen=True)
@@ -70,6 +74,39 @@ def _revocation_mismatch(current: dict[str, Any], replacement: dict[str, Any]) -
         if key not in current or key not in replacement or current[key] != replacement[key]:
             mismatched.append(key)
     return mismatched
+
+
+def _observation_kind(value: Any) -> str:
+    """The JSON basic type of an observed or pattern literal value.
+
+    A boolean is its own basic type and is never treated as a number, even
+    though Python models ``bool`` as a subclass of ``int``.
+    """
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "string"
+
+
+def _observation_match(actual: Any, operator: str, expected: Any) -> bool:
+    """Whether one observed value satisfies one pattern comparison."""
+    if operator in ("=", "!="):
+        # Equality compares by value only when both sides share a JSON basic
+        # type; a type mismatch is no match, for `!=` just as for `=`.
+        if _observation_kind(actual) != _observation_kind(expected):
+            return False
+        return actual == expected if operator == "=" else actual != expected
+    # The ordering operators compare numbers only; anything else is no match.
+    if _observation_kind(actual) != "number" or _observation_kind(expected) != "number":
+        return False
+    if operator == "<":
+        return actual < expected
+    if operator == ">":
+        return actual > expected
+    if operator == "<=":
+        return actual <= expected
+    return actual >= expected
 
 
 class StixRelay:
@@ -460,6 +497,68 @@ class StixRelay:
             "added_at": [row["added_at"] for row in rows],
         }
         return Result(payload, 200)
+
+    # ----------------------------------------------------------------- matches
+
+    def match_indicators(self, collection_id: str, raw: Any) -> dict[str, Any]:
+        """Current-version indicator matches for a set of observed values.
+
+        Read only: the access check runs before any body validation, and the
+        evaluation creates no version, cursor, snapshot, or idempotency
+        record and never modifies the database.
+        """
+        self._require_readable(collection_id)
+        if not isinstance(raw, dict):
+            raise ValidationError("matches body must be a JSON object")
+        unknown = sorted(set(raw) - set(MATCHES_PROPERTIES))
+        if unknown:
+            raise ValidationError(
+                f"matches has unsupported properties: {', '.join(unknown)}"
+            )
+        if "observations" not in raw:
+            raise ValidationError("matches requires the observations property")
+        observations = raw["observations"]
+        if not isinstance(observations, dict) or not observations:
+            raise ValidationError("observations must be a non-empty JSON object")
+        for path, value in observations.items():
+            if not isinstance(path, str) or not path:
+                raise ValidationError("observation keys must be non-empty strings")
+            if isinstance(value, (bool, str)):
+                continue
+            if isinstance(value, int):
+                continue
+            if isinstance(value, float) and math.isfinite(value):
+                continue
+            raise ValidationError(
+                "observation values must be strings, finite numbers, or booleans"
+            )
+        include_revoked = raw.get("include_revoked", False)
+        if not isinstance(include_revoked, bool):
+            raise ValidationError("include_revoked must be a boolean")
+
+        documents = self._current_documents(
+            self.store.connection, collection_id, ("indicator",), None
+        )
+        matches: list[dict[str, Any]] = []
+        for document in documents:
+            if document.get("revoked", False) and not include_revoked:
+                continue
+            parsed = parse_pattern(document["pattern"])
+            if parsed is None:
+                continue
+            path, operator, expected = parsed
+            if path not in observations:
+                continue
+            if _observation_match(observations[path], operator, expected):
+                matches.append(
+                    {
+                        "id": document["id"],
+                        "modified": document["modified"],
+                        "pattern": document["pattern"],
+                    }
+                )
+        matches.sort(key=lambda item: item["id"])
+        return {"matches": matches, "count": len(matches)}
 
     # ------------------------------------------------------------------ export
 
