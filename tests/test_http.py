@@ -63,6 +63,17 @@ class HttpTests(unittest.TestCase):
             finally:
                 error.close()
 
+    def request_raw(self, path: str):
+        request = urllib.request.Request(self.base + path, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.headers.get("Content-Type"), response.read()
+        except urllib.error.HTTPError as error:
+            try:
+                return error.code, error.headers.get("Content-Type"), error.read()
+            finally:
+                error.close()
+
     def test_health(self):
         status, body = self.request("GET", "/health")
         self.assertEqual(200, status)
@@ -828,6 +839,187 @@ class HttpTests(unittest.TestCase):
         )
         self.assertEqual(409, status)
         self.assertEqual("conflict", body["error"]["code"])
+
+    # ---------------------------------------------------------------- export
+
+    def _seed_export_collection(self):
+        self.request("POST", "/taxii2/collections", {"id": "ex1", "title": "Exports"}, "ex0")
+        posts = (
+            (dict(identity(), added_at="2024-01-02T00:00:00Z"), "ex1-i1"),
+            (dict(indicator(), added_at="2024-01-03T00:00:00Z"), "ex1-n1"),
+            (
+                dict(
+                    identity(modified="2024-02-01T00:00:00Z", name="Renamed Org"),
+                    added_at="2024-02-02T00:00:00Z",
+                ),
+                "ex1-i2",
+            ),
+            (
+                dict(
+                    identity(modified="2024-03-01T00:00:00Z", name="Renamed Org"),
+                    revoked=True,
+                    added_at="2024-03-02T00:00:00Z",
+                ),
+                "ex1-i3",
+            ),
+        )
+        for payload, key in posts:
+            status, _ = self.request("POST", "/taxii2/collections/ex1/objects/", payload, key)
+            self.assertEqual(201, status)
+
+    def test_export_defaults_to_stix_bundle_with_or_without_trailing_slash(self):
+        self._seed_export_collection()
+        for path in ("/taxii2/collections/ex1/export", "/taxii2/collections/ex1/export/"):
+            status, content_type, raw = self.request_raw(path)
+            self.assertEqual(200, status, path)
+            self.assertEqual("application/stix+json;version=2.1", content_type, path)
+            bundle = json.loads(raw)
+            self.assertEqual({"type", "objects"}, set(bundle), path)
+            self.assertEqual("bundle", bundle["type"], path)
+            self.assertEqual(
+                [INDICATOR_ID, IDENTITY_ID],
+                [item["id"] for item in bundle["objects"]],
+                path,
+            )
+            for item in bundle["objects"]:
+                self.assertNotIn("added_at", item)
+                self.assertNotIn("collection_id", item)
+                self.assertNotIn("version", item)
+            self.assertIs(bundle["objects"][1]["revoked"], True)
+
+    def test_export_ndjson_is_one_object_per_line_with_a_final_newline(self):
+        self._seed_export_collection()
+        status, content_type, raw = self.request_raw(
+            "/taxii2/collections/ex1/export?format=ndjson"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("application/x-ndjson", content_type)
+        self.assertTrue(raw.endswith(b"\n"))
+        lines = raw.split(b"\n")
+        self.assertEqual(b"", lines[-1])
+        documents = [json.loads(line) for line in lines[:-1]]
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID], [item["id"] for item in documents])
+
+    def test_export_empty_results(self):
+        self.request("POST", "/taxii2/collections", {"id": "ex2", "title": "Empty"}, "ex20")
+        status, content_type, raw = self.request_raw("/taxii2/collections/ex2/export")
+        self.assertEqual(200, status)
+        self.assertEqual("application/stix+json;version=2.1", content_type)
+        self.assertEqual({"type": "bundle", "objects": []}, json.loads(raw))
+        status, content_type, raw = self.request_raw(
+            "/taxii2/collections/ex2/export?format=ndjson"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("application/x-ndjson", content_type)
+        self.assertEqual(b"", raw)
+
+    def test_export_versions_all_ordering_cutoff_and_revocations(self):
+        self._seed_export_collection()
+        status, _, raw = self.request_raw(
+            "/taxii2/collections/ex1/export?versions=all"
+        )
+        self.assertEqual(200, status)
+        documents = json.loads(raw)["objects"]
+        self.assertEqual(
+            [
+                (IDENTITY_ID, "2024-01-01T00:00:00.000000Z", None),
+                (INDICATOR_ID, "2024-01-01T00:00:00.000000Z", None),
+                (IDENTITY_ID, "2024-02-01T00:00:00.000000Z", None),
+                (IDENTITY_ID, "2024-03-01T00:00:00.000000Z", True),
+            ],
+            [
+                (item["id"], item["modified"], item.get("revoked"))
+                for item in documents
+            ],
+        )
+        # added_after acts on each version's own added_at: the cutoff excludes
+        # everything received at or before 2024-02-02, leaving the revocation only.
+        status, _, raw = self.request_raw(
+            "/taxii2/collections/ex1/export?versions=all&added_after=2024-02-02T00:00:00Z"
+        )
+        documents = json.loads(raw)["objects"]
+        self.assertEqual(
+            [(IDENTITY_ID, "2024-03-01T00:00:00.000000Z")],
+            [(item["id"], item["modified"]) for item in documents],
+        )
+
+    def test_export_formats_and_version_modes_express_the_same_set_and_order(self):
+        self._seed_export_collection()
+        for mode in ("current", "all"):
+            _, _, stix_raw = self.request_raw(
+                f"/taxii2/collections/ex1/export?versions={mode}"
+            )
+            _, _, ndjson_raw = self.request_raw(
+                f"/taxii2/collections/ex1/export?versions={mode}&format=ndjson"
+            )
+            from_stix = json.loads(stix_raw)["objects"]
+            from_ndjson = [json.loads(line) for line in ndjson_raw.splitlines()]
+            self.assertEqual(from_stix, from_ndjson, mode)
+
+    def test_export_validation_errors_keep_the_taxii_error_shape(self):
+        self._seed_export_collection()
+        bad_paths = (
+            "format=xml",
+            "format=stix&format=ndjson",
+            "versions=latest",
+            "versions=current&versions=all",
+            "type=campaign",
+            "added_after=not-a-timestamp",
+            "limit=1",
+            "next=token",
+            "unknown=1",
+        )
+        for query in bad_paths:
+            status, content_type, raw = self.request_raw(
+                f"/taxii2/collections/ex1/export?{query}"
+            )
+            self.assertEqual(400, status, query)
+            self.assertEqual("application/taxii+json;version=2.1", content_type, query)
+            body = json.loads(raw)
+            self.assertEqual("validation_error", body["error"]["code"], query)
+
+    def test_export_access_check_runs_before_parameter_validation(self):
+        self.request(
+            "POST",
+            "/taxii2/collections",
+            {"id": "exhidden", "title": "Hidden export", "can_read": False},
+            "exh0",
+        )
+        for path in (
+            "/taxii2/collections/exhidden/export",
+            "/taxii2/collections/exhidden/export?format=xml",
+            "/taxii2/collections/exhidden/export?unknown=1",
+            "/taxii2/collections/exmissing/export",
+            "/taxii2/collections/exmissing/export?versions=all&versions=current",
+        ):
+            status, content_type, raw = self.request_raw(path)
+            self.assertEqual(404, status, path)
+            self.assertEqual("application/taxii+json;version=2.1", content_type, path)
+            self.assertEqual(
+                {"error": {"code": "not_found", "message": "collection access is denied"}},
+                json.loads(raw),
+                path,
+            )
+
+    def test_export_does_not_change_the_collection(self):
+        self._seed_export_collection()
+        self.request_raw("/taxii2/collections/ex1/export?versions=all")
+        self.request_raw("/taxii2/collections/ex1/export?format=ndjson")
+        # The ordinary read still sees exactly the two current objects.
+        status, body = self.request("GET", "/taxii2/collections/ex1/objects/")
+        self.assertEqual(200, status)
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID], [item["id"] for item in body["objects"]])
+        status, body = self.request(
+            "GET", f"/taxii2/collections/ex1/objects/{IDENTITY_ID}/versions/"
+        )
+        self.assertEqual(
+            [
+                "2024-01-01T00:00:00.000000Z",
+                "2024-02-01T00:00:00.000000Z",
+                "2024-03-01T00:00:00.000000Z",
+            ],
+            body["versions"],
+        )
 
 
 if __name__ == "__main__":

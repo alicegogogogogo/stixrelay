@@ -344,6 +344,58 @@ Returns every revision of one object, oldest first:
 
 An object with no revision in that collection is `not_found`.
 
+### Export a collection
+
+```http
+GET /taxii2/collections/feed/export/?format=stix&versions=current&type=indicator&added_after=2024-01-01T00:00:00Z
+```
+
+The path is accepted with or without its trailing slash. The export reuses the
+existing collection read permission check (unknown or `can_read: false`
+collections are the usual `404 not_found` with `collection access is denied`),
+and `type` and `added_after` keep their exact validation and filtering
+semantics from object reads. Two extra parameters are accepted, each at most
+once:
+
+- `format` selects the rendering: `stix` (the default) or `ndjson`;
+- `versions` selects which revisions are exported: `current` (the default) or
+  `all`.
+
+`format=stix` returns `application/stix+json;version=2.1` with a body of only
+`type` and `objects`:
+
+```json
+{"type":"bundle","objects":[{"type":"indicator","...":"..."}]}
+```
+
+Bundle members are the stored objects themselves; storage metadata
+(`added_at`, `collection_id`, `version`) is never mixed into them. With no
+results the bundle is `{"type":"bundle","objects":[]}`.
+
+`format=ndjson` returns `application/x-ndjson`: one complete object per line,
+each line terminated by `\n`. With no results the body is zero bytes.
+
+Version modes:
+
+- `versions=current` exports the current version of each id, i.e. exactly the
+  result set and order (`added_at`, then object id) of an unpaginated object
+  read under the same `type`/`added_after` filter. A currently revoked object is
+  exported;
+- `versions=all` exports every matching historical revision. `added_after`
+  applies strictly to each version's own `added_at`, results are ordered by
+  `added_at`, object id, then `modified`, and each version appears once.
+  Revocations are not hidden: the pre-revocation history is kept alongside the
+  revoked current version.
+
+The two formats always express the same objects in the same order. An export is
+read only: it starts no pagination snapshot, issues no cursor, writes no
+version or idempotency record, and never modifies the database.
+
+Repeated or unsupported `format`/`versions`, an invalid `type` or
+`added_after`, and `limit`, `next`, or any other unknown query parameter are
+`400 validation_error`. Parameter validation runs only after the collection
+read check, so a bad query against an unreadable collection stays `404`.
+
 ## Errors
 
 Errors use this shape:

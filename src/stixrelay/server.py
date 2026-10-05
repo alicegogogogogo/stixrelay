@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .errors import NotFoundError, StixRelayError, ValidationError
-from .service import StixRelay
+from .service import Export, StixRelay
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -24,6 +24,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _raw(self, status: int, export: Export) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", export.media_type)
+        self.send_header("Content-Length", str(len(export.body)))
+        self.end_headers()
+        self.wfile.write(export.body)
+
     def _body(self) -> Any:
         content_type = self.headers.get("Content-Type", "")
         if content_type.split(";", 1)[0].strip().lower() != "application/json":
@@ -36,16 +43,26 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as error:
             raise ValidationError("request body must be valid JSON") from error
 
-    def _dispatch(self) -> tuple[int, Any]:
+    def _dispatch(self) -> tuple[int, Any] | Export:
         split = urlsplit(self.path)
         parts = [unquote(part) for part in split.path.split("/") if part]
         query = parse_qs(split.query, keep_blank_values=True)
+        export_route = (
+            len(parts) == 4
+            and parts[:2] == ["taxii2", "collections"]
+            and parts[3] == "export"
+            and self.command == "GET"
+        )
         objects_route = (
             len(parts) == 4
             and parts[:2] == ["taxii2", "collections"]
             and parts[3] == "objects"
             and self.command == "GET"
         )
+        # The export route validates its own parameters, and only after the
+        # collection read check, so an invalid query never reveals existence.
+        if export_route:
+            return self.service.export_collection(parts[2], query)
         allowed = {"type", "added_after"}
         if objects_route:
             allowed |= {"limit", "next"}
@@ -100,8 +117,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         try:
-            status, response = self._dispatch()
-            self._json(status, response)
+            response = self._dispatch()
+            if isinstance(response, Export):
+                self._raw(response.status, response)
+            else:
+                status, payload = response
+                self._json(status, payload)
         except StixRelayError as error:
             self._json(error.status, {"error": {"code": error.code, "message": str(error)}})
         except Exception:

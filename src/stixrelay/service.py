@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -19,6 +20,11 @@ from .store import Store
 
 COLLECTION_PROPERTIES = ("id", "title", "description", "can_read", "can_write")
 
+NDJSON_MEDIA_TYPE = "application/x-ndjson"
+EXPORT_FORMATS = ("stix", "ndjson")
+EXPORT_VERSIONS = ("current", "all")
+EXPORT_QUERY_PARAMETERS = ("type", "added_after", "format", "versions")
+
 
 @dataclass(frozen=True)
 class Result:
@@ -29,6 +35,15 @@ class Result:
 
     def to_json(self) -> dict[str, Any]:
         return self.payload
+
+
+@dataclass(frozen=True)
+class Export:
+    """A rendered collection export: media type plus the already encoded body."""
+
+    media_type: str
+    body: bytes
+    status: int = 200
 
 
 def _object_result(document: dict[str, Any], collection_id: str, added_at: str, status: int) -> Result:
@@ -445,3 +460,82 @@ class StixRelay:
             "added_at": [row["added_at"] for row in rows],
         }
         return Result(payload, 200)
+
+    # ------------------------------------------------------------------ export
+
+    def export_collection(
+        self,
+        collection_id: str,
+        query: Any,
+    ) -> Export:
+        # Access is decided before touching any parameter, exactly like the other
+        # collection reads, so a bad query never reveals whether a collection exists.
+        self._require_readable(collection_id)
+        if not isinstance(query, dict):
+            raise ValidationError("query parameters must be a mapping")
+        extra = sorted(set(query) - set(EXPORT_QUERY_PARAMETERS))
+        if extra:
+            raise ValidationError(f"unsupported query parameters: {', '.join(extra)}")
+        export_format = self._choice(query, "format", EXPORT_FORMATS, "stix")
+        version_mode = self._choice(query, "versions", EXPORT_VERSIONS, "current")
+        requested = self._identity(query.get("type")) if query.get("type") is not None else None
+        cutoff = self._added_after(query.get("added_after"))
+
+        if version_mode == "current":
+            documents = self._current_documents(
+                self.store.connection, collection_id, requested, cutoff
+            )
+        else:
+            documents = self._all_version_documents(collection_id, requested, cutoff)
+
+        if export_format == "ndjson":
+            body = b"".join(
+                (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+                for document in documents
+            )
+            return Export(NDJSON_MEDIA_TYPE, body)
+        body = json.dumps(
+            {"type": "bundle", "objects": documents},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        return Export(MEDIA_TYPE, body)
+
+    @staticmethod
+    def _choice(query: dict[str, Any], name: str, allowed: tuple[str, ...], default: str) -> str:
+        raw = query.get(name)
+        if raw is None:
+            return default
+        if not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], str):
+            raise ValidationError(f"{name} must be supplied exactly once")
+        value = raw[0]
+        if value not in allowed:
+            raise ValidationError(f"{name} must be one of {', '.join(allowed)}; got {value}")
+        return value
+
+    def _all_version_documents(
+        self,
+        collection_id: str,
+        requested: tuple[str, ...] | None,
+        cutoff: str | None,
+    ) -> list[dict[str, Any]]:
+        """Every stored revision matching the filter, in export order.
+
+        Each version is filtered by its own ``added_at`` (strictly half-open) and
+        ordered by ``added_at``, object id, then ``modified``.
+        """
+        sql = "SELECT document, added_at FROM objects WHERE collection_id = ?"
+        parameters: list[Any] = [collection_id]
+        if requested is not None:
+            placeholders = ", ".join("?" for _ in requested)
+            sql += f" AND type IN ({placeholders})"
+            parameters.extend(requested)
+        sql += " ORDER BY added_at, object_id, version"
+        rows = self.store.connection.execute(sql, parameters).fetchall()
+
+        documents: list[dict[str, Any]] = []
+        for row in rows:
+            if cutoff is not None and timestamp_value(row["added_at"]) <= timestamp_value(cutoff):
+                continue
+            documents.append(self.store.decode(row["document"]))
+        return documents

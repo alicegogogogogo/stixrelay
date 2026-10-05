@@ -1,9 +1,11 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from stixrelay.errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
-from stixrelay.service import StixRelay
+from stixrelay.model import MEDIA_TYPE
+from stixrelay.service import NDJSON_MEDIA_TYPE, StixRelay
 
 IDENTITY_ID = "identity--f431f809-377b-45e0-aa1c-6a4751cae5ff"
 INDICATOR_ID = "indicator--a2f4b7d8-2c7e-4a4b-9d0e-6f6a1c9d3f21"
@@ -1468,6 +1470,225 @@ class StixRelayTests(unittest.TestCase):
         token = cursor_module.encode(other.store.cursor_secret, 1, 1, "feed")
         with self.assertRaisesRegex(ValidationError, "modified or was not issued"):
             self.service.list_objects("feed", next_token=[token])
+
+    # ------------------------------------------------------------------ export
+
+    @staticmethod
+    def _query(**parameters: str) -> dict:
+        return {name: [value] for name, value in parameters.items()}
+
+    def _seed_export_history(self):
+        # identity v1 arrives first; indicator v1 arrives second; identity v2
+        # (a normal revision) arrives third; the identity revocation arrives last.
+        self.add(identity(), "exp-i1", added_at="2024-01-02T00:00:00Z")
+        self.add(indicator(), "exp-n1", added_at="2024-01-03T00:00:00Z")
+        self.add(
+            identity(modified="2024-02-01T00:00:00Z", name="Renamed Org"),
+            "exp-i2",
+            added_at="2024-02-02T00:00:00Z",
+        )
+        self.add(
+            revoked(identity(modified="2024-03-01T00:00:00Z", name="Renamed Org")),
+            "exp-i3",
+            added_at="2024-03-02T00:00:00Z",
+        )
+
+    def test_export_defaults_to_a_stix_bundle_of_current_documents(self):
+        self._seed_export_history()
+        export = self.service.export_collection("feed", {})
+        self.assertEqual(200, export.status)
+        self.assertEqual(MEDIA_TYPE, export.media_type)
+        bundle = json.loads(export.body)
+        self.assertEqual(["type", "objects"], list(bundle))
+        self.assertEqual("bundle", bundle["type"])
+        # Only current versions: the indicator, then the revoked identity current.
+        self.assertEqual(
+            [(INDICATOR_ID, "2024-01-01T00:00:00.000000Z", None),
+             (IDENTITY_ID, "2024-03-01T00:00:00.000000Z", True)],
+            [
+                (document["id"], document["modified"], document.get("revoked"))
+                for document in bundle["objects"]
+            ],
+        )
+        for document in bundle["objects"]:
+            self.assertNotIn("added_at", document)
+            self.assertNotIn("collection_id", document)
+            self.assertNotIn("version", document)
+
+    def test_export_current_matches_the_unpaginated_object_read(self):
+        self._seed_export_history()
+        export = self.service.export_collection(
+            "feed", self._query(type="identity", added_after="2024-01-01T00:00:00Z")
+        )
+        bundle = json.loads(export.body)
+        listed = self.service.list_objects(
+            "feed", ["identity"], ["2024-01-01T00:00:00Z"]
+        ).to_json()["objects"]
+        self.assertEqual(listed, bundle["objects"])
+
+    def test_export_ndjson_emits_one_object_per_line_ending_in_newline(self):
+        self._seed_export_history()
+        export = self.service.export_collection(
+            "feed", self._query(format="ndjson")
+        )
+        self.assertEqual(NDJSON_MEDIA_TYPE, export.media_type)
+        text = export.body.decode()
+        self.assertTrue(text.endswith("\n"))
+        lines = text.split("\n")
+        self.assertEqual("", lines[-1])
+        documents = [json.loads(line) for line in lines[:-1]]
+        self.assertEqual(2, len(documents))
+        self.assertEqual([INDICATOR_ID, IDENTITY_ID], [item["id"] for item in documents])
+
+    def test_export_empty_stix_has_empty_objects_and_ndjson_is_zero_bytes(self):
+        stix = self.service.export_collection("feed", {})
+        self.assertEqual(MEDIA_TYPE, stix.media_type)
+        self.assertEqual({"type": "bundle", "objects": []}, json.loads(stix.body))
+        ndjson = self.service.export_collection("feed", self._query(format="ndjson"))
+        self.assertEqual(NDJSON_MEDIA_TYPE, ndjson.media_type)
+        self.assertEqual(b"", ndjson.body)
+
+    def test_export_versions_all_keeps_every_revision_in_export_order(self):
+        self._seed_export_history()
+        export = self.service.export_collection(
+            "feed", self._query(versions="all")
+        )
+        documents = json.loads(export.body)["objects"]
+        self.assertEqual(
+            [
+                (IDENTITY_ID, "2024-01-01T00:00:00.000000Z"),
+                (INDICATOR_ID, "2024-01-01T00:00:00.000000Z"),
+                (IDENTITY_ID, "2024-02-01T00:00:00.000000Z"),
+                (IDENTITY_ID, "2024-03-01T00:00:00.000000Z"),
+            ],
+            [(document["id"], document["modified"]) for document in documents],
+        )
+        # The pre-revocation history survives alongside the revoked current version.
+        self.assertNotIn("revoked", documents[0])
+        self.assertNotIn("revoked", documents[2])
+        self.assertIs(documents[3]["revoked"], True)
+
+    def test_export_versions_all_sorts_same_added_at_by_id_then_modified(self):
+        # Two different objects and two versions of one id, all received at once.
+        self.add(indicator(), "exp-order-n", added_at="2024-01-02T00:00:00Z")
+        self.add(identity(modified="2024-01-01T00:00:00Z"), "exp-order-i1",
+                 added_at="2024-01-02T00:00:00Z")
+        self.add(identity(modified="2024-02-01T00:00:00Z", name="Renamed Org"),
+                 "exp-order-i2", added_at="2024-01-02T00:00:00Z")
+        documents = json.loads(
+            self.service.export_collection(
+                "feed", self._query(versions="all")
+            ).body
+        )["objects"]
+        self.assertEqual(
+            [
+                (IDENTITY_ID, "2024-01-01T00:00:00.000000Z"),
+                (IDENTITY_ID, "2024-02-01T00:00:00.000000Z"),
+                (INDICATOR_ID, "2024-01-01T00:00:00.000000Z"),
+            ],
+            [(document["id"], document["modified"]) for document in documents],
+        )
+
+    def test_export_versions_all_applies_added_after_to_each_version(self):
+        self._seed_export_history()
+        documents = json.loads(
+            self.service.export_collection(
+                "feed",
+                self._query(versions="all", added_after="2024-02-02T00:00:00Z"),
+            ).body
+        )["objects"]
+        # The version received exactly at the cutoff is excluded; only the
+        # revocation, received strictly later, remains of the identity's history.
+        self.assertEqual(
+            [(IDENTITY_ID, "2024-03-01T00:00:00.000000Z")],
+            [(document["id"], document["modified"]) for document in documents],
+        )
+
+    def test_export_type_filter_applies_to_both_version_modes(self):
+        self._seed_export_history()
+        for mode in ("current", "all"):
+            documents = json.loads(
+                self.service.export_collection(
+                    "feed", self._query(versions=mode, type="indicator")
+                ).body
+            )["objects"]
+            self.assertEqual(
+                [INDICATOR_ID], [document["id"] for document in documents], mode
+            )
+
+    def test_export_formats_share_one_object_set_and_order(self):
+        self._seed_export_history()
+        for mode in ("current", "all"):
+            stix = json.loads(
+                self.service.export_collection(
+                    "feed", self._query(versions=mode)
+                ).body
+            )["objects"]
+            ndjson = [
+                json.loads(line)
+                for line in self.service.export_collection(
+                    "feed", self._query(versions=mode, format="ndjson")
+                ).body.decode().splitlines()
+            ]
+            self.assertEqual(stix, ndjson, mode)
+
+    def test_export_query_validation(self):
+        self._seed_export_history()
+        cases = (
+            {"format": ["xml"]},
+            {"format": ["stix", "ndjson"]},
+            {"versions": ["latest"]},
+            {"versions": ["current", "all"]},
+            {"type": ["campaign"]},
+            {"added_after": ["not-a-timestamp"]},
+            {"limit": ["1"]},
+            {"next": ["token"]},
+            {"unknown": ["1"]},
+        )
+        for query in cases:
+            with self.assertRaisesRegex(ValidationError, "validation|must|unsupported"):
+                self.service.export_collection("feed", query)
+
+    def test_export_denied_or_missing_collection_is_not_found_even_with_bad_query(self):
+        self.service.create_collection(
+            {"id": "restricted", "title": "Restricted", "can_read": False}, "cr"
+        )
+        # The bad format must not turn into a 400 that proves the collection exists.
+        for collection_id in ("restricted", "missing"):
+            with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
+                self.service.export_collection(
+                    collection_id, {"format": ["xml"], "unknown": ["1"]}
+                )
+
+    def test_export_creates_no_snapshots_versions_or_idempotency_records(self):
+        self._seed_export_history()
+        snapshot_count = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS count FROM snapshots"
+        ).fetchone()["count"]
+        idempotency_count = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS count FROM idempotency"
+        ).fetchone()["count"]
+        for query in ({}, {"format": ["ndjson"]}, {"versions": ["all"]}):
+            self.service.export_collection("feed", query)
+        self.assertEqual(
+            snapshot_count,
+            self.service.store.connection.execute(
+                "SELECT COUNT(*) AS count FROM snapshots"
+            ).fetchone()["count"],
+        )
+        self.assertEqual(
+            idempotency_count,
+            self.service.store.connection.execute(
+                "SELECT COUNT(*) AS count FROM idempotency"
+            ).fetchone()["count"],
+        )
+        # Objects and their version history read exactly as before the exports.
+        self.assertEqual(
+            4,
+            self.service.store.connection.execute(
+                "SELECT COUNT(*) AS count FROM objects"
+            ).fetchone()["count"],
+        )
 
 
 if __name__ == "__main__":
