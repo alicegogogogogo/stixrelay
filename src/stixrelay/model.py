@@ -44,6 +44,15 @@ _COMPARISON = r"(?:=|!=|<=|>=|<|>)"
 _VALUE = r"(?:'[^']*'|[-]?[0-9]+(?:\.[0-9]+)?|true|false)"
 _OBJECT_PATH = r"(?:[A-Za-z]|[0-9]|[_.'\-])+"
 
+# Splits a validated single-comparison pattern into object path, operator, and
+# value. The path is captured non-greedily so whitespace around the operator
+# stays out of it; the path itself keeps its case and quoting exactly.
+_COMPARISON_PATTERN = re.compile(
+    r"\[(?P<path>" + _OBJECT_PATH + r":" + _PROPERTY_CHAR + r"+?)"
+    r"\s*(?P<operator>=|!=|<=|>=|<|>)\s*"
+    r"(?P<value>'[^']*'|[-]?[0-9]+(?:\.[0-9]+)?|true|false)\]"
+)
+
 STIX_ID = re.compile(
     _LOWER + _TYPE_CHAR + r"*--" + _HEX + r"{8}-" + _HEX + r"{4}-4" + _HEX + r"{3}-"
     r"(?:[89ab])" + _HEX + r"{3}-" + _HEX + r"{12}"
@@ -183,6 +192,31 @@ def validate_identifier(value: Any, field: str) -> str:
 
 def identifier_type(value: str) -> str:
     return value.split("--", 1)[0]
+
+
+def parse_comparison(pattern: str) -> tuple[str, str, Any]:
+    """Split a validated STIX pattern into object path, operator, and Python value.
+
+    The path is the full ``object-type:property`` text exactly as written (case
+    and quoting preserved); the value becomes a ``str``, ``int``/``float``, or
+    ``bool`` so it can be compared with a decoded JSON observation value.
+    """
+    match = _COMPARISON_PATTERN.fullmatch(pattern)
+    if match is None:
+        raise ValidationError("pattern is not a supported single comparison")
+    token = match.group("value")
+    value: Any
+    if token == "true":
+        value = True
+    elif token == "false":
+        value = False
+    elif token.startswith("'"):
+        value = token[1:-1]
+    elif "." in token:
+        value = float(token)
+    else:
+        value = int(token)
+    return match.group("path"), match.group("operator"), value
 
 
 def _validate_string(value: Any, field: str) -> str:

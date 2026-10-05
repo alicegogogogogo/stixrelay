@@ -396,6 +396,55 @@ Repeated or unsupported `format`/`versions`, an invalid `type` or
 `400 validation_error`. Parameter validation runs only after the collection
 read check, so a bad query against an unreadable collection stays `404`.
 
+### Match observations against indicators
+
+```http
+POST /taxii2/collections/feed/matches
+Content-Type: application/json
+
+{"observations": {"file:hashes.'SHA-256'": "aa", "file:size": 150}}
+```
+
+Scores a set of observed values against the **current version** of every
+indicator in the collection and returns the indicators whose single-comparison
+pattern the observations satisfy:
+
+```json
+{
+  "matches": [
+    {
+      "id": "indicator--a2f4b7d8-2c7e-4a4b-9d0e-6f6a1c9d3f21",
+      "modified": "2024-01-01T00:00:00.000000Z",
+      "pattern": "[file:hashes.'SHA-256' = 'aa']"
+    }
+  ],
+  "count": 1
+}
+```
+
+- the body is a JSON object with `observations` (required) and
+  `include_revoked` (optional, default `false`) and nothing else;
+- `observations` is a non-empty object whose keys are the full object paths
+  from indicator patterns (for example `file:hashes.'SHA-256'`) and whose
+  values are strings, finite numbers, or booleans;
+- paths match exactly, case and quoting included; whitespace around the
+  pattern operator is not part of the path, and an observation whose path no
+  pattern uses simply matches nothing;
+- `=` and `!=` compare by value only when both sides share a JSON basic type
+  (a boolean is never a number); `<`, `>`, `<=`, and `>=` apply to numbers
+  only — any other combination does not match;
+- revoked indicators are skipped unless `include_revoked` is `true`, in which
+  case their current (revoked) versions are checked too;
+- each indicator appears at most once, ordered by id; with no hits the
+  response is `{"matches": [], "count": 0}`.
+
+The route is read only: it needs no `Idempotency-Key` and creates no version,
+cursor, snapshot, or idempotency record. A body that is not an object, is
+missing `observations`, carries an empty or non-object `observations`, an
+empty path key, a non-scalar value, a non-boolean `include_revoked`, or any
+unknown property is `400 validation_error`; the collection read check runs
+first, so unknown or `can_read: false` collections stay `404 not_found`.
+
 ## Errors
 
 Errors use this shape:

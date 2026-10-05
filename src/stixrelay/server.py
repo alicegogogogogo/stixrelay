@@ -105,6 +105,15 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return result.status, result.to_json()
         if (
+            len(parts) == 4
+            and parts[:2] == ["taxii2", "collections"]
+            and parts[3] == "matches"
+            and self.command == "POST"
+        ):
+            # A read-only lookup: no Idempotency-Key, and nothing is stored.
+            body = self._body()
+            return 200, self.service.match_indicators(parts[2], body)
+        if (
             len(parts) == 6
             and parts[:2] == ["taxii2", "collections"]
             and parts[3] == "objects"

@@ -1022,5 +1022,76 @@ class HttpTests(unittest.TestCase):
         )
 
 
+    def test_matches_endpoint_scores_observations_without_writes(self):
+        self.request("POST", "/taxii2/collections", {"id": "mx", "title": "Match feed"}, "mx0")
+        self.request(
+            "POST",
+            "/taxii2/collections/mx/objects/",
+            dict(indicator(), added_at=IDENTITY_ADDED_AT),
+            "mx1",
+        )
+        # No Idempotency-Key: the route is a read-only lookup.
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/mx/matches",
+            {"observations": {"file:hashes.'SHA-256'": "aa"}},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(1, body["count"])
+        self.assertEqual(
+            [
+                {
+                    "id": INDICATOR_ID,
+                    "modified": "2024-01-01T00:00:00.000000Z",
+                    "pattern": "[file:hashes.'SHA-256' = 'aa']",
+                }
+            ],
+            body["matches"],
+        )
+        status, body = self.request(
+            "POST",
+            "/taxii2/collections/mx/matches",
+            {"observations": {"file:hashes.'SHA-256'": "zz"}},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual({"matches": [], "count": 0}, body)
+        # Nothing was stored: the object history is exactly what the writes left.
+        status, body = self.request(
+            "GET", f"/taxii2/collections/mx/objects/{INDICATOR_ID}/versions/"
+        )
+        self.assertEqual(["2024-01-01T00:00:00.000000Z"], body["versions"])
+
+    def test_matches_validation_and_access_errors_keep_the_taxii_error_shape(self):
+        self.request("POST", "/taxii2/collections", {"id": "mv", "title": "Match feed"}, "mv0")
+        for body in (
+            [],
+            {},
+            {"observations": {}},
+            {"observations": {"file:name": None}},
+            {"observations": {"file:name": "x"}, "include_revoked": "yes"},
+            {"observations": {"file:name": "x"}, "unknown": 1},
+        ):
+            status, payload = self.request("POST", "/taxii2/collections/mv/matches", body)
+            self.assertEqual(400, status, body)
+            self.assertEqual("validation_error", payload["error"]["code"], body)
+        # Missing and unreadable collections answer 404 before any body validation.
+        self.request(
+            "POST",
+            "/taxii2/collections",
+            {"id": "mvhidden", "title": "Hidden", "can_read": False},
+            "mv1",
+        )
+        for collection_id in ("mvhidden", "mvmissing"):
+            status, payload = self.request(
+                "POST", f"/taxii2/collections/{collection_id}/matches", {"unknown": 1}
+            )
+            self.assertEqual(404, status, collection_id)
+            self.assertEqual("not_found", payload["error"]["code"], collection_id)
+        # The route is POST-only.
+        status, payload = self.request("GET", "/taxii2/collections/mv/matches")
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", payload["error"]["code"])
+
+
 if __name__ == "__main__":
     unittest.main()

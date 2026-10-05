@@ -1691,5 +1691,190 @@ class StixRelayTests(unittest.TestCase):
         )
 
 
+INDICATOR2_ID = "indicator--1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f"
+
+
+def indicator2(*, modified: str = CREATED, pattern: str = "[file:size > 100]") -> dict:
+    return dict(indicator(modified=modified, pattern=pattern), id=INDICATOR2_ID)
+
+
+class MatchTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = StixRelay(str(Path(self.directory.name) / "test.db"))
+        self.service.create_collection({"id": "feed", "title": "Primary feed"}, "c1")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def add(self, payload: dict, key: str, added_at: str = "2024-01-02T00:00:00Z"):
+        return self.service.add_object("feed", dict(payload, added_at=added_at), key).to_json()
+
+    def match(self, body: dict, collection_id: str = "feed") -> dict:
+        return self.service.match_indicators(collection_id, body)
+
+    def test_equality_match_returns_id_modified_and_pattern(self):
+        self.add(indicator(), "k1")
+        result = self.match({"observations": {"file:hashes.'SHA-256'": "aa"}})
+        self.assertEqual(1, result["count"])
+        self.assertEqual(
+            [
+                {
+                    "id": INDICATOR_ID,
+                    "modified": "2024-01-01T00:00:00.000000Z",
+                    "pattern": "[file:hashes.'SHA-256' = 'aa']",
+                }
+            ],
+            result["matches"],
+        )
+
+    def test_no_match_returns_empty_result(self):
+        self.add(indicator(), "k1")
+        for observations in (
+            {"file:hashes.'SHA-256'": "bb"},
+            {"file:hashes.'MD5'": "aa"},
+            {"file:hashes.'sha-256'": "aa"},
+            {"other": "aa"},
+        ):
+            result = self.match({"observations": observations})
+            self.assertEqual({"matches": [], "count": 0}, result)
+
+    def test_path_matching_is_exact_in_case_and_quoting(self):
+        self.add(indicator(pattern="[file:hashes.'SHA-256'='aa']"), "k1")
+        result = self.match({"observations": {"file:hashes.'SHA-256'": "aa"}})
+        self.assertEqual(1, result["count"])
+        result = self.match({"observations": {"file:hashes.SHA-256": "aa"}})
+        self.assertEqual(0, result["count"])
+
+    def test_whitespace_around_operator_is_not_part_of_the_path(self):
+        self.add(indicator(pattern="[file:name   =   'x']"), "k1")
+        result = self.match({"observations": {"file:name": "x"}})
+        self.assertEqual(1, result["count"])
+        result = self.match({"observations": {"file:name   ": "x"}})
+        self.assertEqual(0, result["count"])
+
+    def test_not_equal_and_numeric_ordering_operators(self):
+        self.add(indicator(pattern="[file:name != 'x']"), "k1")
+        self.add(indicator2(), "k2")
+        result = self.match({"observations": {"file:name": "y", "file:size": 150}})
+        self.assertEqual([INDICATOR2_ID, INDICATOR_ID], [m["id"] for m in result["matches"]])
+        result = self.match({"observations": {"file:name": "x", "file:size": 100}})
+        self.assertEqual([], result["matches"])
+        for index, (pattern, hit, miss) in enumerate((
+            ("[file:size < 100]", 50, 100),
+            ("[file:size <= 100]", 100, 101),
+            ("[file:size >= 100]", 100, 99),
+        )):
+            service = StixRelay(str(Path(self.directory.name) / f"ops{index}.db"))
+            service.create_collection({"id": "ops", "title": "Ops"}, "c2")
+            service.add_object(
+                "ops", dict(indicator(pattern=pattern), added_at="2024-01-02T00:00:00Z"), "k"
+            )
+            self.assertEqual(
+                1, service.match_indicators("ops", {"observations": {"file:size": hit}})["count"]
+            )
+            self.assertEqual(
+                0, service.match_indicators("ops", {"observations": {"file:size": miss}})["count"]
+            )
+
+    def test_numbers_compare_by_value_across_int_and_float(self):
+        self.add(indicator(pattern="[file:size = 100]"), "k1")
+        self.assertEqual(1, self.match({"observations": {"file:size": 100.0}})["count"])
+
+    def test_type_mismatch_never_matches_and_boolean_is_not_a_number(self):
+        self.add(indicator(pattern="[file:size = 1]"), "k1")
+        self.add(indicator2(pattern="[file:flag = true]"), "k2")
+        # 1 is a number, True is a boolean: neither equality fires across kinds.
+        result = self.match({"observations": {"file:size": True, "file:flag": 1}})
+        self.assertEqual(0, result["count"])
+        # Ordering operators only apply to numbers.
+        result = self.match({"observations": {"file:size": "2"}})
+        self.assertEqual(0, result["count"])
+
+    def test_ordering_operators_do_not_apply_to_strings(self):
+        self.add(indicator(pattern="[file:name < 'b']"), "k1")
+        self.assertEqual(0, self.match({"observations": {"file:name": "a"}})["count"])
+
+    def test_not_equal_requires_the_same_json_type(self):
+        self.add(indicator(pattern="[file:name != 'x']"), "k1")
+        self.assertEqual(0, self.match({"observations": {"file:name": 5}})["count"])
+
+    def test_only_indicators_are_matched(self):
+        self.add(identity(), "k1")
+        self.assertEqual(
+            {"matches": [], "count": 0}, self.match({"observations": {"file:name": "x"}})
+        )
+
+    def test_only_the_current_version_is_checked(self):
+        self.add(indicator(pattern="[file:name = 'x']"), "k1")
+        self.add(indicator(modified="2024-02-01T00:00:00Z", pattern="[file:name = 'y']"), "k2")
+        result = self.match({"observations": {"file:name": "x"}})
+        self.assertEqual(0, result["count"])
+        result = self.match({"observations": {"file:name": "y"}})
+        self.assertEqual("2024-02-01T00:00:00.000000Z", result["matches"][0]["modified"])
+
+    def test_revoked_indicators_are_skipped_unless_requested(self):
+        self.add(indicator(), "k1")
+        self.add(revoked(indicator(modified="2024-02-01T00:00:00Z")), "k2")
+        observations = {"observations": {"file:hashes.'SHA-256'": "aa"}}
+        self.assertEqual(0, self.match(observations)["count"])
+        result = self.match(dict(observations, include_revoked=True))
+        self.assertEqual(1, result["count"])
+        self.assertEqual(INDICATOR_ID, result["matches"][0]["id"])
+
+    def test_matches_are_sorted_by_id_and_listed_once(self):
+        self.add(indicator(pattern="[file:name = 'x']"), "k1")
+        self.add(indicator2(pattern="[file:name = 'x']"), "k2")
+        result = self.match({"observations": {"file:name": "x"}})
+        self.assertEqual(2, result["count"])
+        self.assertEqual([INDICATOR2_ID, INDICATOR_ID], [m["id"] for m in result["matches"]])
+
+    def test_missing_or_unreadable_collection_is_not_found_before_body_validation(self):
+        self.service.create_collection(
+            {"id": "restricted", "title": "Restricted", "can_read": False}, "cr"
+        )
+        for collection_id in ("restricted", "missing"):
+            for body in ({"observations": {"file:name": "x"}}, [], {"unknown": 1}):
+                with self.assertRaisesRegex(NotFoundError, "collection access is denied"):
+                    self.service.match_indicators(collection_id, body)
+
+    def test_body_validation(self):
+        cases = (
+            [],
+            {},
+            {"observations": None},
+            {"observations": {}},
+            {"observations": []},
+            {"observations": {"": "x"}},
+            {"observations": {"file:name": None}},
+            {"observations": {"file:name": ["x"]}},
+            {"observations": {"file:name": {"nested": 1}}},
+            {"observations": {"file:name": float("nan")}},
+            {"observations": {"file:name": float("inf")}},
+            {"observations": {"file:name": "x"}, "include_revoked": "yes"},
+            {"observations": {"file:name": "x"}, "unknown": 1},
+        )
+        for body in cases:
+            with self.assertRaisesRegex(ValidationError, "."):
+                self.match(body)
+
+    def test_matching_creates_no_versions_cursors_snapshots_or_idempotency_records(self):
+        self.add(indicator(), "k1")
+        counts = {}
+        for table in ("objects", "snapshots", "snapshot_entries", "idempotency"):
+            counts[table] = self.service.store.connection.execute(
+                f"SELECT COUNT(*) AS count FROM {table}"
+            ).fetchone()["count"]
+        self.match({"observations": {"file:hashes.'SHA-256'": "aa"}})
+        self.match({"observations": {"file:hashes.'SHA-256'": "bb"}, "include_revoked": True})
+        for table, count in counts.items():
+            self.assertEqual(
+                count,
+                self.service.store.connection.execute(
+                    f"SELECT COUNT(*) AS count FROM {table}"
+                ).fetchone()["count"],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

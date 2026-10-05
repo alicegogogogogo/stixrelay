@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -14,6 +15,7 @@ from .model import (
     StixObject,
     canonical_timestamp,
     identifier_type,
+    parse_comparison,
     timestamp_value,
 )
 from .store import Store
@@ -24,6 +26,40 @@ NDJSON_MEDIA_TYPE = "application/x-ndjson"
 EXPORT_FORMATS = ("stix", "ndjson")
 EXPORT_VERSIONS = ("current", "all")
 EXPORT_QUERY_PARAMETERS = ("type", "added_after", "format", "versions")
+
+MATCHES_PROPERTIES = ("observations", "include_revoked")
+
+
+def _json_kind(value: Any) -> str:
+    """The JSON basic type of a scalar; a boolean is never a number."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "string"
+
+
+def _comparison_matches(operator: str, expected: Any, observed: Any) -> bool:
+    """Whether ``observed <operator> expected`` holds under STIX comparison rules.
+
+    Equality only applies when both sides share a JSON basic type, and the
+    ordering operators only apply to numbers; anything else is not a match.
+    """
+    if _json_kind(observed) != _json_kind(expected):
+        return False
+    if operator == "=":
+        return observed == expected
+    if operator == "!=":
+        return observed != expected
+    if _json_kind(observed) != "number":
+        return False
+    if operator == "<":
+        return observed < expected
+    if operator == ">":
+        return observed > expected
+    if operator == "<=":
+        return observed <= expected
+    return observed >= expected
 
 
 @dataclass(frozen=True)
@@ -461,7 +497,65 @@ class StixRelay:
         }
         return Result(payload, 200)
 
-    # ------------------------------------------------------------------ export
+    # ------------------------------------------------------------------ matches
+
+    def match_indicators(self, collection_id: str, raw: Any) -> dict[str, Any]:
+        """Match observations against the current indicator versions.
+
+        Read-only: no version, cursor, snapshot, or idempotency record is
+        created, and the access check runs before any body validation.
+        """
+        self._require_readable(collection_id)
+        if not isinstance(raw, dict):
+            raise ValidationError("matches body must be a JSON object")
+        unknown = sorted(set(raw) - set(MATCHES_PROPERTIES))
+        if unknown:
+            raise ValidationError(f"matches has unsupported properties: {', '.join(unknown)}")
+        if "observations" not in raw:
+            raise ValidationError("matches requires the observations property")
+        observations = raw["observations"]
+        if not isinstance(observations, dict) or not observations:
+            raise ValidationError("observations must be a non-empty JSON object")
+        for path, value in observations.items():
+            if not isinstance(path, str) or not path:
+                raise ValidationError("observations keys must be non-empty strings")
+            if isinstance(value, (bool, str)):
+                continue
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                continue
+            raise ValidationError(
+                "observations values must be strings, finite numbers, or booleans"
+            )
+        include_revoked = raw.get("include_revoked", False)
+        if not isinstance(include_revoked, bool):
+            raise ValidationError("include_revoked must be a boolean")
+
+        rows = self.store.connection.execute(
+            "SELECT document FROM ("
+            "  SELECT document,"
+            "         ROW_NUMBER() OVER (PARTITION BY object_id ORDER BY version DESC) AS rank"
+            "  FROM objects WHERE collection_id = ? AND type = 'indicator'"
+            ") WHERE rank = 1",
+            (collection_id,),
+        ).fetchall()
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            document = self.store.decode(row["document"])
+            if document.get("revoked", False) and not include_revoked:
+                continue
+            path, operator, expected = parse_comparison(document["pattern"])
+            if path not in observations:
+                continue
+            if _comparison_matches(operator, expected, observations[path]):
+                matches.append(
+                    {
+                        "id": document["id"],
+                        "modified": document["modified"],
+                        "pattern": document["pattern"],
+                    }
+                )
+        matches.sort(key=lambda match: match["id"])
+        return {"matches": matches, "count": len(matches)}
 
     def export_collection(
         self,
